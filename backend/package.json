@@ -1,0 +1,16 @@
+{
+  "name": "campaign-backend",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "mysql2": "^3.11.5"
+  },
+  "scripts": {
+    "dev": "node index.js",
+    "start": "node index.js",
+    "schema:mysql": "node scripts/apply-mysql-schema.mjs",
+    "migrate:mysql": "node scripts/migrate-file-stores-to-mysql.mjs",
+    "smoke:workspace": "bash scripts/smoke-workspace.sh"
+  }
+}
