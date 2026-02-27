@@ -355,7 +355,7 @@ export interface CampaignIssue {
 
 export interface CampaignReminder {
   id: string;
-  type: "inactive_concept" | "unresolved_mention" | "approval_pending" | "overdue_issue";
+  type: "inactive_concept" | "unresolved_mention" | "approval_pending" | "overdue_issue" | "segment_due_action";
   severity: "info" | "warning" | "critical";
   message: string;
   createdAt: string;
@@ -374,6 +374,98 @@ export interface PortfolioConfig {
   scenarioPreset: "balanced" | "growth" | "efficiency" | "risk_control";
   budgetCutPercent: number;
   weights: PortfolioWeights;
+}
+
+export interface TemplateSystemTemplate {
+  id: string;
+  name: string;
+  industry: string;
+  objectiveType: string;
+  defaultSections: string[];
+  localizationHints: string[];
+}
+
+export interface TemplateLocalizationConfig {
+  language: string;
+  tone: string;
+  culturalMustInclude: string[];
+  culturalMustAvoid: string[];
+}
+
+export interface CampaignTemplateSystem {
+  selectedTemplateId: string;
+  availableTemplates: TemplateSystemTemplate[];
+  localization: TemplateLocalizationConfig;
+}
+
+export interface DigitalOpsChannelSla {
+  channel: string;
+  firstResponseHours: number;
+  followUpHours: number;
+}
+
+export interface DigitalOpsChannelMetric {
+  id: string;
+  channel: string;
+  metric: string;
+  value: string;
+  period: string;
+}
+
+export interface CampaignDigitalOps {
+  attributionModel: "last_touch" | "first_touch" | "weighted_multi_touch" | "media_mix";
+  channelSlaHours: DigitalOpsChannelSla[];
+  channelMetrics: DigitalOpsChannelMetric[];
+}
+
+export interface CrmLifecycleSegment {
+  id: string;
+  name: string;
+  lifecycleStage: "acquire" | "onboard" | "retain" | "reactivate";
+  size: number;
+  priority: "high" | "medium" | "low";
+  nextAction: string;
+  dueAt: string;
+  owner: string;
+}
+
+export interface CrmAutomationRule {
+  id: string;
+  trigger: string;
+  action: string;
+  slaHours: number;
+  active: boolean;
+}
+
+export interface CampaignCrmLifecycle {
+  memberRetentionTarget: number;
+  segments: CrmLifecycleSegment[];
+  automationRules: CrmAutomationRule[];
+}
+
+export interface ExperimentHypothesis {
+  id: string;
+  name: string;
+  hypothesis: string;
+  metric: string;
+  baseline: number;
+  target: number;
+  status: "planned" | "running" | "completed" | "stopped";
+  winnerConceptId?: string;
+  startDate: string;
+  endDate?: string;
+}
+
+export interface CampaignExperimentLab {
+  experiments: ExperimentHypothesis[];
+  promoteWinnerConceptId: string;
+}
+
+export interface CampaignGovernancePolicy {
+  requiredApprovalRoles: CampaignApproval["role"][];
+  minApprovedCount: number;
+  requirePreflightPassForReady: boolean;
+  requireNoCriticalIncidentsForReady: boolean;
 }
 
 export interface CampaignSnapshot {
@@ -434,6 +526,11 @@ export interface CampaignData {
   issues?: CampaignIssue[];
   reminders?: CampaignReminder[];
   portfolio?: PortfolioConfig;
+  templateSystem?: CampaignTemplateSystem;
+  digitalOps?: CampaignDigitalOps;
+  crmLifecycle?: CampaignCrmLifecycle;
+  experimentLab?: CampaignExperimentLab;
+  governancePolicy?: CampaignGovernancePolicy;
   snapshots?: CampaignSnapshot[];
   approvals?: CampaignApproval[];
   auditTrail?: CampaignAuditEvent[];

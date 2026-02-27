@@ -258,6 +258,7 @@ export function AIChatDock({ campaigns, activeCampaignId }: Props) {
   const [mentionQuery, setMentionQuery] = useState<MentionQuery | null>(null);
   const [activeSuggestionIndex, setActiveSuggestionIndex] = useState(0);
   const refreshMessagesInFlightRef = useRef(false);
+  const dockBottomClass = activeCampaignId ? "bottom-24 md:bottom-24" : "bottom-5";
 
   const activeCampaign = useMemo(() => {
     if (activeCampaignId) {
@@ -733,7 +734,7 @@ export function AIChatDock({ campaigns, activeCampaignId }: Props) {
       {!open && (
         <Button
           type="button"
-          className="fixed bottom-5 right-5 z-50 shadow-amber gap-2"
+          className={`fixed right-5 z-50 shadow-amber gap-2 ${dockBottomClass}`}
           onClick={() => setOpen(true)}
         >
           <MessageSquare className="h-4 w-4" /> AI Chat
@@ -745,7 +746,7 @@ export function AIChatDock({ campaigns, activeCampaignId }: Props) {
           className={`fixed z-50 flex flex-col bg-background border-primary/30 shadow-xl ${
             isFullscreen
               ? "inset-3 md:inset-6"
-              : "bottom-5 right-5 w-[360px] max-w-[calc(100vw-24px)] h-[520px]"
+              : `${dockBottomClass} right-5 w-[360px] max-w-[calc(100vw-24px)] h-[520px]`
           }`}
         >
           <div className="px-4 py-3 border-b border-border flex items-center justify-between">

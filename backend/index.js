@@ -44,6 +44,25 @@ function loadDotEnv(envPath) {
 
 loadDotEnv(join(__dirname, ".env"));
 
+async function loadWsModule() {
+  try {
+    return await import("ws");
+  } catch {
+    return import("../frontend/node_modules/ws/index.js");
+  }
+}
+
+const wsModule = await loadWsModule();
+const wsNamespace = wsModule?.default && typeof wsModule.default === "function"
+  ? wsModule.default
+  : wsModule;
+const WebSocketServer = wsNamespace?.WebSocketServer || wsNamespace?.Server;
+const WS_OPEN_STATE = wsNamespace?.WebSocket?.OPEN ?? wsNamespace?.OPEN ?? 1;
+
+if (typeof WebSocketServer !== "function") {
+  throw new Error("WebSocket server dependency 'ws' is unavailable.");
+}
+
 const PORT = Number(process.env.PORT || 8787);
 const STORE_PATH = join(__dirname, "data", "campaigns.json");
 const WORKSPACES_DATA_PATH = join(__dirname, "data", "workspaces");
@@ -118,6 +137,26 @@ const CHUNKED_STATE_FORMAT = "chunked-json-v1";
 const STORE_KEY_CAMPAIGNS = "campaigns";
 const STORE_KEY_DRIVE = "drive";
 const STORE_KEY_CHAT = "chat";
+const MYSQL_NORMALIZED_CAMPAIGN_STORAGE = String(
+  process.env.MYSQL_NORMALIZED_CAMPAIGN_STORAGE || "true",
+).toLowerCase() !== "false";
+const CAMPAIGN_CHILD_TABLES = [
+  "campaign_audiences",
+  "campaign_channel_roles",
+  "campaign_media_plan_rows",
+  "campaign_qa_checklist",
+  "campaign_ideas",
+  "campaign_concepts",
+  "campaign_collaboration_members",
+  "campaign_collaboration_messages",
+  "campaign_collaboration_presence",
+  "campaign_evidence_items",
+  "campaign_issues",
+  "campaign_reminders",
+  "campaign_snapshots",
+  "campaign_approvals",
+  "campaign_audit_events",
+];
 const DEFAULT_WORKSPACE_ID = "main";
 const DEFAULT_ALLOWED_ORIGINS = [
   "http://localhost:8080",
@@ -154,6 +193,15 @@ const BACKEND_INCIDENT_LOG_MAX_BYTES = Math.max(
   512 * 1024,
   Number(process.env.BACKEND_INCIDENT_LOG_MAX_BYTES || 5 * 1024 * 1024),
 );
+const REFRESH_SIGNAL_WS_PATH = "/ws/system-refresh";
+const REFRESH_SIGNAL_HEARTBEAT_INTERVAL_MS = Math.max(
+  5_000,
+  Number(process.env.REFRESH_SIGNAL_HEARTBEAT_INTERVAL_MS || 25_000),
+);
+const REFRESH_SIGNAL_CLIENT_STALE_MS = Math.max(
+  REFRESH_SIGNAL_HEARTBEAT_INTERVAL_MS * 2,
+  Number(process.env.REFRESH_SIGNAL_CLIENT_STALE_MS || 75_000),
+);
 const TELEMETRY_INCIDENT_DEFAULT_LIMIT = Math.max(
   10,
   Math.min(500, Number(process.env.TELEMETRY_INCIDENT_DEFAULT_LIMIT || 100)),
@@ -173,8 +221,11 @@ const externalSearchInFlight = new Map();
 const requestRateWindow = new Map();
 const recentRequestEvents = [];
 const realtimeClients = new Map();
+const refreshSignalClients = new Map();
 const knownWorkspaceIds = new Set([DEFAULT_WORKSPACE_ID]);
 const workspaceNotifications = new Map();
+const refreshSignalSocketServer = new WebSocketServer({ noServer: true });
+const normalizedCampaignMigrationChecked = new Set();
 let mysqlPoolPromise = null;
 let mysqlSchemaEnsured = false;
 
@@ -595,6 +646,186 @@ function openRealtimeStream(req, res, url) {
   });
 }
 
+function createRefreshSignalClientId() {
+  return `ws-refresh-${randomUUID()}`;
+}
+
+function normalizeWebSocketMessage(raw) {
+  if (typeof raw === "string") {
+    return raw;
+  }
+  if (raw instanceof Buffer) {
+    return raw.toString("utf8");
+  }
+  if (raw instanceof Uint8Array) {
+    return Buffer.from(raw).toString("utf8");
+  }
+  return "";
+}
+
+function parseWebSocketMessage(raw) {
+  const text = normalizeWebSocketMessage(raw).trim();
+  if (!text) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(text);
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function sendRefreshSignalWebSocketMessage(socket, payload) {
+  if (!socket || socket.readyState !== WS_OPEN_STATE) {
+    return false;
+  }
+  try {
+    socket.send(JSON.stringify(payload ?? {}));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function removeRefreshSignalClient(clientId) {
+  const record = refreshSignalClients.get(clientId);
+  if (!record) {
+    return;
+  }
+  refreshSignalClients.delete(clientId);
+  try {
+    if (record.socket.readyState === WS_OPEN_STATE) {
+      record.socket.close(1000, "Connection closed");
+    }
+  } catch {
+    // no-op
+  }
+}
+
+function broadcastRefreshSignal(reason = "System requested refresh", source = "system", delayMs = 0) {
+  const normalizedReason = hasText(reason) ? String(reason).trim() : "System requested refresh";
+  const safeDelayMs = Number.isFinite(Number(delayMs))
+    ? Math.max(0, Math.min(10_000, Math.round(Number(delayMs))))
+    : 0;
+  const payload = {
+    type: "REFRESH_SIGNAL",
+    reason: normalizedReason,
+    source: hasText(source) ? String(source).trim() : "system",
+    delayMs: safeDelayMs,
+    timestamp: nowIso(),
+  };
+
+  let sent = 0;
+  for (const [clientId, record] of refreshSignalClients.entries()) {
+    const delivered = sendRefreshSignalWebSocketMessage(record.socket, payload);
+    if (delivered) {
+      sent += 1;
+      continue;
+    }
+    removeRefreshSignalClient(clientId);
+  }
+
+  return {
+    sent,
+    connected: refreshSignalClients.size,
+    payload,
+  };
+}
+
+function registerRefreshSignalWebSocket(socket, req, url) {
+  const workspaceId = normalizeWorkspaceId(url.searchParams.get("workspaceId") || getRequestWorkspaceId(req));
+  const clientId = createRefreshSignalClientId();
+  const nowMs = Date.now();
+  refreshSignalClients.set(clientId, {
+    id: clientId,
+    socket,
+    workspaceId,
+    isAlive: true,
+    lastSeenAt: nowMs,
+  });
+
+  sendRefreshSignalWebSocketMessage(socket, {
+    type: "CONNECTED",
+    clientId,
+    workspaceId,
+    heartbeatIntervalMs: REFRESH_SIGNAL_HEARTBEAT_INTERVAL_MS,
+    timestamp: nowIso(),
+  });
+
+  socket.on("pong", () => {
+    const current = refreshSignalClients.get(clientId);
+    if (!current) {
+      return;
+    }
+    current.isAlive = true;
+    current.lastSeenAt = Date.now();
+  });
+
+  socket.on("message", (raw) => {
+    const parsed = parseWebSocketMessage(raw);
+    if (!parsed) {
+      return;
+    }
+    const current = refreshSignalClients.get(clientId);
+    if (!current) {
+      return;
+    }
+    current.isAlive = true;
+    current.lastSeenAt = Date.now();
+
+    const type = String(parsed.type || "").trim().toUpperCase();
+    if (type === "PING") {
+      sendRefreshSignalWebSocketMessage(socket, {
+        type: "PONG",
+        timestamp: nowIso(),
+      });
+    }
+  });
+
+  socket.on("close", () => {
+    refreshSignalClients.delete(clientId);
+  });
+
+  socket.on("error", () => {
+    refreshSignalClients.delete(clientId);
+  });
+}
+
+setInterval(() => {
+  const nowMs = Date.now();
+  for (const [clientId, record] of refreshSignalClients.entries()) {
+    const socket = record?.socket;
+    if (!socket || socket.readyState !== WS_OPEN_STATE) {
+      removeRefreshSignalClient(clientId);
+      continue;
+    }
+
+    if (!record.isAlive || nowMs - record.lastSeenAt > REFRESH_SIGNAL_CLIENT_STALE_MS) {
+      try {
+        socket.terminate();
+      } catch {
+        // no-op
+      }
+      removeRefreshSignalClient(clientId);
+      continue;
+    }
+
+    record.isAlive = false;
+    try {
+      socket.ping();
+    } catch {
+      removeRefreshSignalClient(clientId);
+      continue;
+    }
+
+    sendRefreshSignalWebSocketMessage(socket, {
+      type: "PING",
+      timestamp: nowIso(),
+    });
+  }
+}, REFRESH_SIGNAL_HEARTBEAT_INTERVAL_MS).unref();
+
 function createDefaultCreativeBrief() {
   return {
     activityName: "Get to Know Us",
@@ -665,6 +896,112 @@ function createDefaultCreativeBrief() {
         accessibility: "Subtitles",
       },
     ],
+  };
+}
+
+function createDefaultTemplateSystem() {
+  return {
+    selectedTemplateId: "growth-loop",
+    availableTemplates: [
+      {
+        id: "growth-loop",
+        name: "Growth Loop",
+        description: "Always-on acquisition, retention, and referral cycle.",
+        recommendedChannels: ["Search", "Social", "WhatsApp", "Email"],
+      },
+      {
+        id: "local-trust",
+        name: "Local Trust Builder",
+        description: "Community-led credibility campaigns with local ambassadors.",
+        recommendedChannels: ["Radio", "Community Events", "WhatsApp", "PR"],
+      },
+      {
+        id: "value-bundle",
+        name: "Value Bundle Push",
+        description: "Offer-led campaign with strong loyalty and repeat behavior.",
+        recommendedChannels: ["Email", "SMS", "In-app", "Retail"],
+      },
+    ],
+    localization: {
+      market: "Tanzania",
+      primaryLanguage: "English",
+      secondaryLanguages: [],
+      toneGuidance: "Respect local culture while staying direct and practical.",
+      culturalMustInclude: [],
+      culturalMustAvoid: [],
+    },
+  };
+}
+
+function createDefaultDigitalOps() {
+  return {
+    attributionModel: "weighted_multi_touch",
+    channelSlaHours: [
+      { channel: "WhatsApp", firstResponseHours: 1, followUpHours: 24 },
+      { channel: "Email", firstResponseHours: 6, followUpHours: 48 },
+      { channel: "Social", firstResponseHours: 4, followUpHours: 24 },
+    ],
+    channelMetrics: [],
+  };
+}
+
+function createDefaultCrmLifecycle() {
+  return {
+    memberRetentionTarget: 0.6,
+    segments: [
+      {
+        id: "crm-new",
+        name: "New Prospects",
+        lifecycleStage: "acquire",
+        size: 0,
+        priority: "high",
+        nextAction: "Run onboarding sequence",
+        dueAt: nowIso(),
+        owner: "Growth Lead",
+      },
+      {
+        id: "crm-active",
+        name: "Active Customers",
+        lifecycleStage: "retain",
+        size: 0,
+        priority: "medium",
+        nextAction: "Promote repeat behavior offer",
+        dueAt: nowIso(),
+        owner: "CRM Manager",
+      },
+    ],
+    automationRules: [
+      {
+        id: "rule-inactive-72h",
+        trigger: "no_activity_72h",
+        action: "send_reengagement_nudge",
+        slaHours: 24,
+        active: true,
+      },
+      {
+        id: "rule-unresolved-24h",
+        trigger: "unresolved_comment_24h",
+        action: "notify_owner",
+        slaHours: 12,
+        active: true,
+      },
+    ],
+  };
+}
+
+function createDefaultExperimentLab() {
+  return {
+    experiments: [],
+    promoteWinnerConceptId: "",
+  };
+}
+
+function createDefaultGovernancePolicy() {
+  return {
+    requiredApprovalRoles: ["strategy_lead", "creative_lead", "client_partner"],
+    minApprovedCount: 2,
+    requirePreflightPassForReady: true,
+    requireNoCriticalIncidentsForReady: true,
   };
 }
 
@@ -748,6 +1085,11 @@ function createDefaultCampaignData(options = {}) {
         risk: 0.1,
       },
     },
+    templateSystem: createDefaultTemplateSystem(),
+    digitalOps: createDefaultDigitalOps(),
+    crmLifecycle: createDefaultCrmLifecycle(),
+    experimentLab: createDefaultExperimentLab(),
+    governancePolicy: createDefaultGovernancePolicy(),
     snapshots: [],
     approvals: [],
     auditTrail: [],
@@ -831,6 +1173,85 @@ function ensureEnhancedCampaignDefaults(input) {
   payload.approvals = Array.isArray(payload.approvals) ? payload.approvals : [];
   payload.auditTrail = Array.isArray(payload.auditTrail) ? payload.auditTrail : [];
 
+  payload.templateSystem =
+    payload.templateSystem && typeof payload.templateSystem === "object"
+      ? { ...createDefaultTemplateSystem(), ...payload.templateSystem }
+      : createDefaultTemplateSystem();
+
+  if (!payload.templateSystem.localization || typeof payload.templateSystem.localization !== "object") {
+    payload.templateSystem.localization = createDefaultTemplateSystem().localization;
+  } else {
+    payload.templateSystem.localization = {
+      ...createDefaultTemplateSystem().localization,
+      ...payload.templateSystem.localization,
+    };
+  }
+
+  payload.templateSystem.availableTemplates = Array.isArray(payload.templateSystem.availableTemplates)
+    ? payload.templateSystem.availableTemplates
+    : createDefaultTemplateSystem().availableTemplates;
+  if (!hasText(payload.templateSystem.selectedTemplateId) && payload.templateSystem.availableTemplates[0]?.id) {
+    payload.templateSystem.selectedTemplateId = payload.templateSystem.availableTemplates[0].id;
+  }
+
+  payload.digitalOps =
+    payload.digitalOps && typeof payload.digitalOps === "object"
+      ? { ...createDefaultDigitalOps(), ...payload.digitalOps }
+      : createDefaultDigitalOps();
+  payload.digitalOps.channelSlaHours = Array.isArray(payload.digitalOps.channelSlaHours)
+    ? payload.digitalOps.channelSlaHours
+    : createDefaultDigitalOps().channelSlaHours;
+  payload.digitalOps.channelMetrics = Array.isArray(payload.digitalOps.channelMetrics)
+    ? payload.digitalOps.channelMetrics
+    : [];
+
+  payload.crmLifecycle =
+    payload.crmLifecycle && typeof payload.crmLifecycle === "object"
+      ? { ...createDefaultCrmLifecycle(), ...payload.crmLifecycle }
+      : createDefaultCrmLifecycle();
+  payload.crmLifecycle.segments = Array.isArray(payload.crmLifecycle.segments)
+    ? payload.crmLifecycle.segments
+    : createDefaultCrmLifecycle().segments;
+  payload.crmLifecycle.automationRules = Array.isArray(payload.crmLifecycle.automationRules)
+    ? payload.crmLifecycle.automationRules
+    : createDefaultCrmLifecycle().automationRules;
+  const retentionTarget = Number(payload.crmLifecycle.memberRetentionTarget);
+  payload.crmLifecycle.memberRetentionTarget = Number.isFinite(retentionTarget)
+    ? Math.max(0, Math.min(1, retentionTarget))
+    : createDefaultCrmLifecycle().memberRetentionTarget;
+
+  payload.experimentLab =
+    payload.experimentLab && typeof payload.experimentLab === "object"
+      ? { ...createDefaultExperimentLab(), ...payload.experimentLab }
+      : createDefaultExperimentLab();
+  payload.experimentLab.experiments = Array.isArray(payload.experimentLab.experiments)
+    ? payload.experimentLab.experiments
+    : [];
+  payload.experimentLab.promoteWinnerConceptId = hasText(payload.experimentLab.promoteWinnerConceptId)
+    ? payload.experimentLab.promoteWinnerConceptId.trim()
+    : "";
+
+  payload.governancePolicy =
+    payload.governancePolicy && typeof payload.governancePolicy === "object"
+      ? { ...createDefaultGovernancePolicy(), ...payload.governancePolicy }
+      : createDefaultGovernancePolicy();
+  payload.governancePolicy.requiredApprovalRoles = Array.isArray(payload.governancePolicy.requiredApprovalRoles)
+    ? payload.governancePolicy.requiredApprovalRoles.filter((entry) =>
+        ["strategy_lead", "creative_lead", "client_partner", "compliance"].includes(entry),
+      )
+    : createDefaultGovernancePolicy().requiredApprovalRoles;
+  if (payload.governancePolicy.requiredApprovalRoles.length === 0) {
+    payload.governancePolicy.requiredApprovalRoles = createDefaultGovernancePolicy().requiredApprovalRoles;
+  }
+  const minApprovedCount = Number(payload.governancePolicy.minApprovedCount);
+  payload.governancePolicy.minApprovedCount = Number.isFinite(minApprovedCount)
+    ? Math.max(0, Math.min(10, Math.round(minApprovedCount)))
+    : createDefaultGovernancePolicy().minApprovedCount;
+  payload.governancePolicy.requirePreflightPassForReady =
+    payload.governancePolicy.requirePreflightPassForReady !== false;
+  payload.governancePolicy.requireNoCriticalIncidentsForReady =
+    payload.governancePolicy.requireNoCriticalIncidentsForReady !== false;
+
   return payload;
 }
 
@@ -856,6 +1277,90 @@ function isMysqlConfigured() {
 
 function isMysqlStorageEnabled() {
   return STORAGE_MODE !== "file";
+}
+
+function isMysqlNormalizedCampaignStorageEnabled() {
+  return isMysqlStorageEnabled() && MYSQL_NORMALIZED_CAMPAIGN_STORAGE;
+}
+
+function safeJsonParse(value, fallbackValue) {
+  if (typeof value !== "string" || value.trim() === "") {
+    return clone(fallbackValue);
+  }
+  try {
+    const parsed = JSON.parse(value);
+    if (parsed === null || typeof parsed !== "object") {
+      return clone(fallbackValue);
+    }
+    return parsed;
+  } catch {
+    return clone(fallbackValue);
+  }
+}
+
+function safeJsonParseArray(value, fallbackValue = []) {
+  const parsed = safeJsonParse(value, fallbackValue);
+  return Array.isArray(parsed) ? parsed : clone(fallbackValue);
+}
+
+function safeJsonStringify(value, fallbackValue) {
+  try {
+    return JSON.stringify(value ?? fallbackValue);
+  } catch {
+    return JSON.stringify(fallbackValue);
+  }
+}
+
+function normalizeDateOnlyFromMysql(value, fallbackValue = "") {
+  if (typeof value === "string") {
+    return value.slice(0, 10);
+  }
+  if (value instanceof Date && Number.isFinite(value.getTime())) {
+    const year = value.getUTCFullYear();
+    const month = String(value.getUTCMonth() + 1).padStart(2, "0");
+    const day = String(value.getUTCDate()).padStart(2, "0");
+    return `${year}-${month}-${day}`;
+  }
+  return fallbackValue;
+}
+
+function normalizeIsoFromMysql(value, fallbackValue = nowIso()) {
+  if (typeof value === "string" && value.trim()) {
+    const normalized = value.includes("T") ? value : value.replace(" ", "T");
+    const withZone = normalized.endsWith("Z") ? normalized : `${normalized}Z`;
+    const parsed = Date.parse(withZone);
+    if (Number.isFinite(parsed)) {
+      return new Date(parsed).toISOString();
+    }
+  }
+  if (value instanceof Date && Number.isFinite(value.getTime())) {
+    return value.toISOString();
+  }
+  return fallbackValue;
+}
+
+function normalizeDateTimeForMysql(value, fallbackValue = nowIso()) {
+  const parsed = Date.parse(typeof value === "string" ? value : "");
+  const source = Number.isFinite(parsed) ? new Date(parsed) : new Date(fallbackValue);
+  if (!Number.isFinite(source.getTime())) {
+    return null;
+  }
+  return source.toISOString().slice(0, 23).replace("T", " ");
+}
+
+function normalizeDateOnlyForMysql(value) {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const trimmed = value.trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
+    return trimmed;
+  }
+  const parsed = Date.parse(trimmed);
+  if (!Number.isFinite(parsed)) {
+    return null;
+  }
+  return new Date(parsed).toISOString().slice(0, 10);
 }
 
 function isChunkedStateEnvelope(value) {
@@ -922,6 +1427,24 @@ async function getMysqlPool() {
   return mysqlPoolPromise;
 }
 
+async function ensureMysqlColumn(pool, tableName, columnName, definitionSql) {
+  const [rows] = await pool.execute(
+    `
+      SELECT 1
+      FROM INFORMATION_SCHEMA.COLUMNS
+      WHERE TABLE_SCHEMA = DATABASE()
+        AND TABLE_NAME = ?
+        AND COLUMN_NAME = ?
+      LIMIT 1
+    `,
+    [tableName, columnName],
+  );
+  if (Array.isArray(rows) && rows.length > 0) {
+    return;
+  }
+  await pool.execute(`ALTER TABLE \`${tableName}\` ADD COLUMN ${definitionSql}`);
+}
+
 async function ensureMysqlSchema() {
   if (!isMysqlStorageEnabled() || mysqlSchemaEnsured) {
     return;
@@ -981,6 +1504,355 @@ async function ensureMysqlSchema() {
       KEY idx_incident_request_id (request_id),
       KEY idx_incident_type (type),
       KEY idx_incident_source (source)
+    )
+  `);
+
+  await pool.execute(`
+    CREATE TABLE IF NOT EXISTS campaigns (
+      workspace_id VARCHAR(64) NOT NULL DEFAULT 'main',
+      campaign_id VARCHAR(120) NOT NULL,
+      name VARCHAR(255) NOT NULL DEFAULT '',
+      country VARCHAR(120) NOT NULL DEFAULT '',
+      languages_json LONGTEXT NOT NULL,
+      start_date DATE NULL,
+      end_date DATE NULL,
+      status VARCHAR(20) NOT NULL DEFAULT 'draft',
+      workflow_stage VARCHAR(40) NOT NULL DEFAULT 'draft',
+      workflow_stage_updated_at DATETIME(3) NULL,
+      workflow_wip_limit INT NOT NULL DEFAULT 3,
+      behavior_statement LONGTEXT NULL,
+      behavior_current LONGTEXT NULL,
+      behavior_desired LONGTEXT NULL,
+      behavior_context LONGTEXT NULL,
+      insight_text LONGTEXT NULL,
+      insight_evidence_source LONGTEXT NULL,
+      insight_confidence_level VARCHAR(20) NOT NULL DEFAULT 'medium',
+      driver_types_json LONGTEXT NOT NULL,
+      driver_text LONGTEXT NULL,
+      driver_why_now LONGTEXT NULL,
+      driver_tension LONGTEXT NULL,
+      situation LONGTEXT NULL,
+      problem LONGTEXT NULL,
+      prior_learnings LONGTEXT NULL,
+      business_objective LONGTEXT NULL,
+      communication_objective LONGTEXT NULL,
+      creative_brief_json LONGTEXT NOT NULL,
+      content_themes_and_calendar LONGTEXT NULL,
+      deliverables_needed LONGTEXT NULL,
+      measurement_and_learning_plan LONGTEXT NULL,
+      governance_risks_and_approvals LONGTEXT NULL,
+      timeline_details LONGTEXT NULL,
+      appendices LONGTEXT NULL,
+      portfolio_json LONGTEXT NOT NULL,
+      template_system_json LONGTEXT NOT NULL,
+      digital_ops_json LONGTEXT NOT NULL,
+      crm_lifecycle_json LONGTEXT NOT NULL,
+      experiment_lab_json LONGTEXT NOT NULL,
+      governance_policy_json LONGTEXT NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (workspace_id, campaign_id),
+      KEY idx_campaign_workspace_updated (workspace_id, updated_at),
+      KEY idx_campaign_workspace_status (workspace_id, status),
+      KEY idx_campaign_workspace_stage (workspace_id, workflow_stage)
+    )
+  `);
+
+  await ensureMysqlColumn(pool, "campaigns", "template_system_json", "template_system_json LONGTEXT NULL");
+  await ensureMysqlColumn(pool, "campaigns", "digital_ops_json", "digital_ops_json LONGTEXT NULL");
+  await ensureMysqlColumn(pool, "campaigns", "crm_lifecycle_json", "crm_lifecycle_json LONGTEXT NULL");
+  await ensureMysqlColumn(pool, "campaigns", "experiment_lab_json", "experiment_lab_json LONGTEXT NULL");
+  await ensureMysqlColumn(pool, "campaigns", "governance_policy_json", "governance_policy_json LONGTEXT NULL");
+
+  await pool.execute(`
+    CREATE TABLE IF NOT EXISTS campaign_audiences (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      workspace_id VARCHAR(64) NOT NULL,
+      campaign_id VARCHAR(120) NOT NULL,
+      audience_id VARCHAR(120) NOT NULL,
+      priority VARCHAR(20) NOT NULL DEFAULT 'primary',
+      segment_name TEXT NULL,
+      description_text LONGTEXT NULL,
+      barriers LONGTEXT NULL,
+      motivators LONGTEXT NULL,
+      desired_action LONGTEXT NULL,
+      key_message LONGTEXT NULL,
+      support_rtb LONGTEXT NULL,
+      cta LONGTEXT NULL,
+      sort_order INT NOT NULL DEFAULT 0,
+      PRIMARY KEY (id),
+      UNIQUE KEY uniq_campaign_audience (workspace_id, campaign_id, audience_id),
+      KEY idx_campaign_audience_lookup (workspace_id, campaign_id, sort_order)
+    )
+  `);
+
+  await pool.execute(`
+    CREATE TABLE IF NOT EXISTS campaign_channel_roles (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      workspace_id VARCHAR(64) NOT NULL,
+      campaign_id VARCHAR(120) NOT NULL,
+      role_id VARCHAR(120) NOT NULL,
+      category VARCHAR(20) NOT NULL DEFAULT 'owned',
+      channel TEXT NULL,
+      role_text LONGTEXT NULL,
+      sort_order INT NOT NULL DEFAULT 0,
+      PRIMARY KEY (id),
+      UNIQUE KEY uniq_campaign_channel_role (workspace_id, campaign_id, role_id),
+      KEY idx_campaign_channel_role_lookup (workspace_id, campaign_id, sort_order)
+    )
+  `);
+
+  await pool.execute(`
+    CREATE TABLE IF NOT EXISTS campaign_media_plan_rows (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      workspace_id VARCHAR(64) NOT NULL,
+      campaign_id VARCHAR(120) NOT NULL,
+      row_id VARCHAR(120) NOT NULL,
+      channel TEXT NULL,
+      targeting LONGTEXT NULL,
+      flighting LONGTEXT NULL,
+      budget TEXT NULL,
+      kpi LONGTEXT NULL,
+      benchmark LONGTEXT NULL,
+      sort_order INT NOT NULL DEFAULT 0,
+      PRIMARY KEY (id),
+      UNIQUE KEY uniq_campaign_media_plan_row (workspace_id, campaign_id, row_id),
+      KEY idx_campaign_media_plan_lookup (workspace_id, campaign_id, sort_order)
+    )
+  `);
+
+  await pool.execute(`
+    CREATE TABLE IF NOT EXISTS campaign_qa_checklist (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      workspace_id VARCHAR(64) NOT NULL,
+      campaign_id VARCHAR(120) NOT NULL,
+      item_id VARCHAR(120) NOT NULL,
+      label_text LONGTEXT NULL,
+      checked_flag TINYINT(1) NOT NULL DEFAULT 0,
+      sort_order INT NOT NULL DEFAULT 0,
+      PRIMARY KEY (id),
+      UNIQUE KEY uniq_campaign_qa_item (workspace_id, campaign_id, item_id),
+      KEY idx_campaign_qa_lookup (workspace_id, campaign_id, sort_order)
+    )
+  `);
+
+  await pool.execute(`
+    CREATE TABLE IF NOT EXISTS campaign_ideas (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      workspace_id VARCHAR(64) NOT NULL,
+      campaign_id VARCHAR(120) NOT NULL,
+      idea_id VARCHAR(120) NOT NULL,
+      method VARCHAR(40) NOT NULL DEFAULT 'Re-expression',
+      title LONGTEXT NULL,
+      description_text LONGTEXT NULL,
+      link_to_insight LONGTEXT NULL,
+      link_to_driver LONGTEXT NULL,
+      feasibility_score DOUBLE NOT NULL DEFAULT 0,
+      originality_score DOUBLE NOT NULL DEFAULT 0,
+      strategic_fit_score DOUBLE NOT NULL DEFAULT 0,
+      cultural_fit_score DOUBLE NOT NULL DEFAULT 0,
+      selected_flag TINYINT(1) NOT NULL DEFAULT 0,
+      sort_order INT NOT NULL DEFAULT 0,
+      PRIMARY KEY (id),
+      UNIQUE KEY uniq_campaign_idea (workspace_id, campaign_id, idea_id),
+      KEY idx_campaign_idea_lookup (workspace_id, campaign_id, sort_order)
+    )
+  `);
+
+  await pool.execute(`
+    CREATE TABLE IF NOT EXISTS campaign_concepts (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      workspace_id VARCHAR(64) NOT NULL,
+      campaign_id VARCHAR(120) NOT NULL,
+      concept_id VARCHAR(120) NOT NULL,
+      name LONGTEXT NULL,
+      big_idea LONGTEXT NULL,
+      smp LONGTEXT NULL,
+      key_promise LONGTEXT NULL,
+      support_points_json LONGTEXT NOT NULL,
+      tone LONGTEXT NULL,
+      selected_idea_ids_json LONGTEXT NOT NULL,
+      channels_json LONGTEXT NOT NULL,
+      risks_json LONGTEXT NOT NULL,
+      tagline LONGTEXT NULL,
+      key_visual_description LONGTEXT NULL,
+      execution_rationale LONGTEXT NULL,
+      behavior_trigger LONGTEXT NULL,
+      board_data_json LONGTEXT NOT NULL,
+      status VARCHAR(20) NOT NULL DEFAULT 'draft',
+      sort_order INT NOT NULL DEFAULT 0,
+      PRIMARY KEY (id),
+      UNIQUE KEY uniq_campaign_concept (workspace_id, campaign_id, concept_id),
+      KEY idx_campaign_concept_lookup (workspace_id, campaign_id, sort_order)
+    )
+  `);
+
+  await pool.execute(`
+    CREATE TABLE IF NOT EXISTS campaign_collaboration_members (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      workspace_id VARCHAR(64) NOT NULL,
+      campaign_id VARCHAR(120) NOT NULL,
+      member_name VARCHAR(190) NOT NULL,
+      sort_order INT NOT NULL DEFAULT 0,
+      PRIMARY KEY (id),
+      UNIQUE KEY uniq_campaign_collab_member (workspace_id, campaign_id, member_name),
+      KEY idx_campaign_collab_member_lookup (workspace_id, campaign_id, sort_order)
+    )
+  `);
+
+  await pool.execute(`
+    CREATE TABLE IF NOT EXISTS campaign_collaboration_messages (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      workspace_id VARCHAR(64) NOT NULL,
+      campaign_id VARCHAR(120) NOT NULL,
+      message_id VARCHAR(120) NOT NULL,
+      author VARCHAR(190) NOT NULL DEFAULT '',
+      content LONGTEXT NULL,
+      created_at DATETIME(3) NULL,
+      mentions_json LONGTEXT NOT NULL,
+      parent_id VARCHAR(120) NULL,
+      resolved_flag TINYINT(1) NOT NULL DEFAULT 0,
+      resolved_at DATETIME(3) NULL,
+      resolved_by VARCHAR(190) NULL,
+      field_key VARCHAR(190) NULL,
+      anchor_label VARCHAR(255) NULL,
+      sort_order INT NOT NULL DEFAULT 0,
+      PRIMARY KEY (id),
+      UNIQUE KEY uniq_campaign_collab_message (workspace_id, campaign_id, message_id),
+      KEY idx_campaign_collab_message_lookup (workspace_id, campaign_id, sort_order)
+    )
+  `);
+
+  await pool.execute(`
+    CREATE TABLE IF NOT EXISTS campaign_collaboration_presence (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      workspace_id VARCHAR(64) NOT NULL,
+      campaign_id VARCHAR(120) NOT NULL,
+      member_name VARCHAR(190) NOT NULL,
+      field_key VARCHAR(190) NULL,
+      is_typing TINYINT(1) NOT NULL DEFAULT 0,
+      last_seen_at DATETIME(3) NULL,
+      sort_order INT NOT NULL DEFAULT 0,
+      PRIMARY KEY (id),
+      KEY idx_campaign_collab_presence_lookup (workspace_id, campaign_id, sort_order)
+    )
+  `);
+
+  await pool.execute(`
+    CREATE TABLE IF NOT EXISTS campaign_evidence_items (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      workspace_id VARCHAR(64) NOT NULL,
+      campaign_id VARCHAR(120) NOT NULL,
+      evidence_id VARCHAR(120) NOT NULL,
+      section_key VARCHAR(40) NOT NULL DEFAULT 'research',
+      claim LONGTEXT NULL,
+      source LONGTEXT NULL,
+      source_quality VARCHAR(20) NOT NULL DEFAULT 'medium',
+      confidence VARCHAR(20) NOT NULL DEFAULT 'medium',
+      owner VARCHAR(190) NULL,
+      url LONGTEXT NULL,
+      created_at DATETIME(3) NULL,
+      sort_order INT NOT NULL DEFAULT 0,
+      PRIMARY KEY (id),
+      UNIQUE KEY uniq_campaign_evidence_item (workspace_id, campaign_id, evidence_id),
+      KEY idx_campaign_evidence_lookup (workspace_id, campaign_id, sort_order)
+    )
+  `);
+
+  await pool.execute(`
+    CREATE TABLE IF NOT EXISTS campaign_issues (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      workspace_id VARCHAR(64) NOT NULL,
+      campaign_id VARCHAR(120) NOT NULL,
+      issue_id VARCHAR(120) NOT NULL,
+      title LONGTEXT NULL,
+      description_text LONGTEXT NULL,
+      severity VARCHAR(20) NOT NULL DEFAULT 'medium',
+      status VARCHAR(20) NOT NULL DEFAULT 'open',
+      owner VARCHAR(190) NOT NULL DEFAULT 'Unassigned',
+      sla_hours INT NOT NULL DEFAULT 48,
+      created_at DATETIME(3) NULL,
+      updated_at DATETIME(3) NULL,
+      resolved_at DATETIME(3) NULL,
+      postmortem LONGTEXT NULL,
+      sort_order INT NOT NULL DEFAULT 0,
+      PRIMARY KEY (id),
+      UNIQUE KEY uniq_campaign_issue (workspace_id, campaign_id, issue_id),
+      KEY idx_campaign_issue_lookup (workspace_id, campaign_id, sort_order)
+    )
+  `);
+
+  await pool.execute(`
+    CREATE TABLE IF NOT EXISTS campaign_reminders (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      workspace_id VARCHAR(64) NOT NULL,
+      campaign_id VARCHAR(120) NOT NULL,
+      reminder_id VARCHAR(120) NOT NULL,
+      type_key VARCHAR(40) NOT NULL,
+      severity VARCHAR(20) NOT NULL,
+      message LONGTEXT NULL,
+      created_at DATETIME(3) NULL,
+      due_at DATETIME(3) NULL,
+      sort_order INT NOT NULL DEFAULT 0,
+      PRIMARY KEY (id),
+      UNIQUE KEY uniq_campaign_reminder (workspace_id, campaign_id, reminder_id),
+      KEY idx_campaign_reminder_lookup (workspace_id, campaign_id, sort_order)
+    )
+  `);
+
+  await pool.execute(`
+    CREATE TABLE IF NOT EXISTS campaign_snapshots (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      workspace_id VARCHAR(64) NOT NULL,
+      campaign_id VARCHAR(120) NOT NULL,
+      snapshot_id VARCHAR(120) NOT NULL,
+      label_text VARCHAR(255) NOT NULL DEFAULT 'Campaign snapshot',
+      created_at DATETIME(3) NULL,
+      created_by VARCHAR(190) NOT NULL DEFAULT 'System',
+      summary LONGTEXT NULL,
+      state_json LONGTEXT NOT NULL,
+      sort_order INT NOT NULL DEFAULT 0,
+      PRIMARY KEY (id),
+      UNIQUE KEY uniq_campaign_snapshot (workspace_id, campaign_id, snapshot_id),
+      KEY idx_campaign_snapshot_lookup (workspace_id, campaign_id, sort_order)
+    )
+  `);
+
+  await pool.execute(`
+    CREATE TABLE IF NOT EXISTS campaign_approvals (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      workspace_id VARCHAR(64) NOT NULL,
+      campaign_id VARCHAR(120) NOT NULL,
+      approval_id VARCHAR(120) NOT NULL,
+      role_key VARCHAR(40) NOT NULL DEFAULT 'strategy_lead',
+      approver VARCHAR(190) NOT NULL DEFAULT '',
+      signature LONGTEXT NULL,
+      status VARCHAR(20) NOT NULL DEFAULT 'pending',
+      note LONGTEXT NULL,
+      created_at DATETIME(3) NULL,
+      updated_at DATETIME(3) NULL,
+      approved_at DATETIME(3) NULL,
+      sort_order INT NOT NULL DEFAULT 0,
+      PRIMARY KEY (id),
+      UNIQUE KEY uniq_campaign_approval (workspace_id, campaign_id, approval_id),
+      KEY idx_campaign_approval_lookup (workspace_id, campaign_id, sort_order)
+    )
+  `);
+
+  await pool.execute(`
+    CREATE TABLE IF NOT EXISTS campaign_audit_events (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      workspace_id VARCHAR(64) NOT NULL,
+      campaign_id VARCHAR(120) NOT NULL,
+      audit_id VARCHAR(120) NOT NULL,
+      action_key VARCHAR(80) NOT NULL,
+      actor VARCHAR(190) NOT NULL DEFAULT 'System',
+      detail LONGTEXT NULL,
+      created_at DATETIME(3) NULL,
+      sort_order INT NOT NULL DEFAULT 0,
+      PRIMARY KEY (id),
+      UNIQUE KEY uniq_campaign_audit_event (workspace_id, campaign_id, audit_id),
+      KEY idx_campaign_audit_lookup (workspace_id, campaign_id, sort_order)
     )
   `);
 
@@ -1150,6 +2022,1030 @@ async function writeJsonState(stateKey, payload) {
   return payload;
 }
 
+function groupRowsByCampaignId(rows) {
+  const grouped = new Map();
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const campaignId = typeof row?.campaign_id === "string" ? row.campaign_id : "";
+    if (!campaignId) {
+      continue;
+    }
+    if (!grouped.has(campaignId)) {
+      grouped.set(campaignId, []);
+    }
+    grouped.get(campaignId).push(row);
+  }
+  return grouped;
+}
+
+async function fetchCampaignChildRows(pool, tableName, workspaceId, campaignIds, orderBySql) {
+  if (!Array.isArray(campaignIds) || campaignIds.length === 0) {
+    return [];
+  }
+  const placeholders = campaignIds.map(() => "?").join(",");
+  const query = `
+    SELECT *
+    FROM \`${tableName}\`
+    WHERE workspace_id = ?
+      AND campaign_id IN (${placeholders})
+    ORDER BY campaign_id ASC, ${orderBySql}
+  `;
+  const [rows] = await pool.query(query, [workspaceId, ...campaignIds]);
+  return Array.isArray(rows) ? rows : [];
+}
+
+async function replaceCampaignChildRows(connection, tableName, columns, rows) {
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return;
+  }
+
+  const placeholders = `(${columns.map(() => "?").join(",")})`;
+  const valueGroups = rows.map(() => placeholders).join(",");
+  const sql = `INSERT INTO \`${tableName}\` (${columns.map((column) => `\`${column}\``).join(",")}) VALUES ${valueGroups}`;
+  const values = [];
+  for (const row of rows) {
+    for (const column of columns) {
+      values.push(row[column]);
+    }
+  }
+  await connection.query(sql, values);
+}
+
+async function deleteCampaignChildrenByCampaign(connection, workspaceId, campaignId) {
+  for (const tableName of CAMPAIGN_CHILD_TABLES) {
+    await connection.execute(
+      `DELETE FROM \`${tableName}\` WHERE workspace_id = ? AND campaign_id = ?`,
+      [workspaceId, campaignId],
+    );
+  }
+}
+
+async function deleteCampaignChildrenByWorkspace(connection, workspaceId) {
+  for (const tableName of CAMPAIGN_CHILD_TABLES) {
+    await connection.execute(`DELETE FROM \`${tableName}\` WHERE workspace_id = ?`, [workspaceId]);
+  }
+}
+
+function createDefaultPortfolioConfig() {
+  return {
+    scenarioPreset: "balanced",
+    budgetCutPercent: 20,
+    weights: {
+      impact: 0.3,
+      feasibility: 0.2,
+      strategicFit: 0.25,
+      culturalFit: 0.15,
+      risk: 0.1,
+    },
+  };
+}
+
+function buildCampaignFromMysqlRow(baseRow, childrenByType) {
+  const campaignId = typeof baseRow?.campaign_id === "string" ? baseRow.campaign_id : "";
+  const audienceRows = childrenByType.audiences.get(campaignId) || [];
+  const channelRoleRows = childrenByType.channelRoles.get(campaignId) || [];
+  const mediaPlanRows = childrenByType.mediaPlanRows.get(campaignId) || [];
+  const qaRows = childrenByType.qaChecklist.get(campaignId) || [];
+  const ideaRows = childrenByType.ideas.get(campaignId) || [];
+  const conceptRows = childrenByType.concepts.get(campaignId) || [];
+  const collabMemberRows = childrenByType.collaborationMembers.get(campaignId) || [];
+  const collabMessageRows = childrenByType.collaborationMessages.get(campaignId) || [];
+  const collabPresenceRows = childrenByType.collaborationPresence.get(campaignId) || [];
+  const evidenceRows = childrenByType.evidenceItems.get(campaignId) || [];
+  const issueRows = childrenByType.issues.get(campaignId) || [];
+  const reminderRows = childrenByType.reminders.get(campaignId) || [];
+  const snapshotRows = childrenByType.snapshots.get(campaignId) || [];
+  const approvalRows = childrenByType.approvals.get(campaignId) || [];
+  const auditRows = childrenByType.auditEvents.get(campaignId) || [];
+
+  const parsedLanguages = safeJsonParseArray(baseRow?.languages_json, [])
+    .map((entry) => String(entry || "").trim())
+    .filter(Boolean);
+  const parsedDriverTypes = safeJsonParseArray(baseRow?.driver_types_json, [])
+    .map((entry) => String(entry || "").trim())
+    .filter(Boolean);
+
+  const payload = {
+    campaign: {
+      id: campaignId,
+      name: hasText(baseRow?.name) ? String(baseRow.name) : "Untitled Campaign",
+      country: hasText(baseRow?.country) ? String(baseRow.country) : "Tanzania",
+      languages: parsedLanguages,
+      startDate: normalizeDateOnlyFromMysql(baseRow?.start_date, nowDate()),
+      endDate: normalizeDateOnlyFromMysql(baseRow?.end_date, nowDate()),
+      status: ["draft", "in_review", "final"].includes(baseRow?.status) ? baseRow.status : "draft",
+    },
+    audiences: audienceRows.map((row) => ({
+      id: String(row?.audience_id || ""),
+      priority: row?.priority === "secondary" ? "secondary" : "primary",
+      segmentName: String(row?.segment_name || ""),
+      description: String(row?.description_text || ""),
+      barriers: String(row?.barriers || ""),
+      motivators: String(row?.motivators || ""),
+      desiredAction: String(row?.desired_action || ""),
+      keyMessage: String(row?.key_message || ""),
+      supportRtb: String(row?.support_rtb || ""),
+      cta: String(row?.cta || ""),
+    })),
+    behavior: {
+      behaviorStatement: String(baseRow?.behavior_statement || ""),
+      currentBehavior: String(baseRow?.behavior_current || ""),
+      desiredBehavior: String(baseRow?.behavior_desired || ""),
+      context: String(baseRow?.behavior_context || ""),
+    },
+    insight: {
+      insightText: String(baseRow?.insight_text || ""),
+      evidenceSource: String(baseRow?.insight_evidence_source || ""),
+      confidenceLevel: ["low", "medium", "high"].includes(baseRow?.insight_confidence_level)
+        ? baseRow.insight_confidence_level
+        : "medium",
+    },
+    driver: {
+      driverTypes: parsedDriverTypes,
+      driverText: String(baseRow?.driver_text || ""),
+      whyNow: String(baseRow?.driver_why_now || ""),
+      tension: String(baseRow?.driver_tension || ""),
+    },
+    situation: String(baseRow?.situation || ""),
+    problem: String(baseRow?.problem || ""),
+    priorLearnings: String(baseRow?.prior_learnings || ""),
+    businessObjective: String(baseRow?.business_objective || ""),
+    communicationObjective: String(baseRow?.communication_objective || ""),
+    creativeBrief: safeJsonParse(baseRow?.creative_brief_json, createDefaultCreativeBrief()),
+    channelRoles: channelRoleRows.map((row) => ({
+      id: String(row?.role_id || ""),
+      category: ["paid", "owned", "earned"].includes(row?.category) ? row.category : "owned",
+      channel: String(row?.channel || ""),
+      role: String(row?.role_text || ""),
+    })),
+    mediaPlanRows: mediaPlanRows.map((row) => ({
+      id: String(row?.row_id || ""),
+      channel: String(row?.channel || ""),
+      targeting: String(row?.targeting || ""),
+      flighting: String(row?.flighting || ""),
+      budget: String(row?.budget || ""),
+      kpi: String(row?.kpi || ""),
+      benchmark: String(row?.benchmark || ""),
+    })),
+    contentThemesAndCalendar: String(baseRow?.content_themes_and_calendar || ""),
+    deliverablesNeeded: String(baseRow?.deliverables_needed || ""),
+    measurementAndLearningPlan: String(baseRow?.measurement_and_learning_plan || ""),
+    governanceRisksAndApprovals: String(baseRow?.governance_risks_and_approvals || ""),
+    timelineDetails: String(baseRow?.timeline_details || ""),
+    appendices: String(baseRow?.appendices || ""),
+    qaChecklist: qaRows.map((row) => ({
+      id: String(row?.item_id || ""),
+      label: String(row?.label_text || ""),
+      checked: Number(row?.checked_flag || 0) === 1,
+    })),
+    ideas: ideaRows.map((row) => ({
+      id: String(row?.idea_id || ""),
+      method: hasText(row?.method) ? String(row.method) : "Re-expression",
+      title: String(row?.title || ""),
+      description: String(row?.description_text || ""),
+      linkToInsight: String(row?.link_to_insight || ""),
+      linkToDriver: String(row?.link_to_driver || ""),
+      feasibilityScore: Number(row?.feasibility_score || 0),
+      originalityScore: Number(row?.originality_score || 0),
+      strategicFitScore: Number(row?.strategic_fit_score || 0),
+      culturalFitScore: Number(row?.cultural_fit_score || 0),
+      selected: Number(row?.selected_flag || 0) === 1,
+    })),
+    concepts: conceptRows.map((row) => ({
+      id: String(row?.concept_id || ""),
+      name: String(row?.name || ""),
+      bigIdea: String(row?.big_idea || ""),
+      smp: String(row?.smp || ""),
+      keyPromise: String(row?.key_promise || ""),
+      supportPoints: safeJsonParseArray(row?.support_points_json, []).map((entry) => String(entry || "")),
+      tone: String(row?.tone || ""),
+      selectedIdeaIds: safeJsonParseArray(row?.selected_idea_ids_json, []).map((entry) => String(entry || "")),
+      channels: safeJsonParseArray(row?.channels_json, []).map((entry) => String(entry || "")),
+      risks: safeJsonParseArray(row?.risks_json, []).map((entry) => String(entry || "")),
+      tagline: String(row?.tagline || ""),
+      keyVisualDescription: String(row?.key_visual_description || ""),
+      executionRationale: String(row?.execution_rationale || ""),
+      behaviorTrigger: String(row?.behavior_trigger || ""),
+      boardData: safeJsonParse(row?.board_data_json, {}),
+      status: ["draft", "shortlisted", "final"].includes(row?.status) ? row.status : "draft",
+    })),
+    collaboration: {
+      members: collabMemberRows.map((row) => String(row?.member_name || "")).filter(Boolean),
+      messages: collabMessageRows.map((row) => ({
+        id: String(row?.message_id || ""),
+        author: String(row?.author || ""),
+        content: String(row?.content || ""),
+        createdAt: normalizeIsoFromMysql(row?.created_at),
+        mentions: safeJsonParseArray(row?.mentions_json, []).map((entry) => String(entry || "")),
+        parentId: hasText(row?.parent_id) ? String(row.parent_id) : undefined,
+        resolved: Number(row?.resolved_flag || 0) === 1,
+        resolvedAt: row?.resolved_at ? normalizeIsoFromMysql(row.resolved_at) : undefined,
+        resolvedBy: hasText(row?.resolved_by) ? String(row.resolved_by) : undefined,
+        fieldKey: hasText(row?.field_key) ? String(row.field_key) : undefined,
+        anchorLabel: hasText(row?.anchor_label) ? String(row.anchor_label) : undefined,
+      })),
+      presence: collabPresenceRows.map((row) => ({
+        member: String(row?.member_name || ""),
+        fieldKey: hasText(row?.field_key) ? String(row.field_key) : undefined,
+        isTyping: Number(row?.is_typing || 0) === 1,
+        lastSeenAt: normalizeIsoFromMysql(row?.last_seen_at),
+      })),
+    },
+    workflow: {
+      stage: ["draft", "review", "approved", "ready_to_launch"].includes(baseRow?.workflow_stage)
+        ? baseRow.workflow_stage
+        : "draft",
+      stageUpdatedAt: normalizeIsoFromMysql(baseRow?.workflow_stage_updated_at),
+      wipLimit: Number.isFinite(Number(baseRow?.workflow_wip_limit))
+        ? Math.max(1, Math.min(12, Math.round(Number(baseRow.workflow_wip_limit))))
+        : 3,
+    },
+    evidenceItems: evidenceRows.map((row) => ({
+      id: String(row?.evidence_id || ""),
+      section: hasText(row?.section_key) ? String(row.section_key) : "research",
+      claim: String(row?.claim || ""),
+      source: String(row?.source || ""),
+      sourceQuality: ["low", "medium", "high"].includes(row?.source_quality) ? row.source_quality : "medium",
+      confidence: ["low", "medium", "high"].includes(row?.confidence) ? row.confidence : "medium",
+      owner: hasText(row?.owner) ? String(row.owner) : "",
+      url: hasText(row?.url) ? String(row.url) : "",
+      createdAt: normalizeIsoFromMysql(row?.created_at),
+    })),
+    issues: issueRows.map((row) => ({
+      id: String(row?.issue_id || ""),
+      title: String(row?.title || ""),
+      description: String(row?.description_text || ""),
+      severity: ["low", "medium", "high", "critical"].includes(row?.severity) ? row.severity : "medium",
+      status: ["open", "in_progress", "resolved"].includes(row?.status) ? row.status : "open",
+      owner: String(row?.owner || "Unassigned"),
+      slaHours: Number.isFinite(Number(row?.sla_hours)) ? Math.max(1, Number(row.sla_hours)) : 48,
+      createdAt: normalizeIsoFromMysql(row?.created_at),
+      updatedAt: normalizeIsoFromMysql(row?.updated_at),
+      resolvedAt: row?.resolved_at ? normalizeIsoFromMysql(row.resolved_at) : undefined,
+      postmortem: hasText(row?.postmortem) ? String(row.postmortem) : undefined,
+    })),
+    reminders: reminderRows.map((row) => ({
+      id: String(row?.reminder_id || ""),
+      type: hasText(row?.type_key) ? String(row.type_key) : "inactive_concept",
+      severity: ["info", "warning", "critical"].includes(row?.severity) ? row.severity : "info",
+      message: String(row?.message || ""),
+      createdAt: normalizeIsoFromMysql(row?.created_at),
+      dueAt: row?.due_at ? normalizeIsoFromMysql(row.due_at) : undefined,
+    })),
+    portfolio: safeJsonParse(baseRow?.portfolio_json, createDefaultPortfolioConfig()),
+    templateSystem: safeJsonParse(baseRow?.template_system_json, createDefaultTemplateSystem()),
+    digitalOps: safeJsonParse(baseRow?.digital_ops_json, createDefaultDigitalOps()),
+    crmLifecycle: safeJsonParse(baseRow?.crm_lifecycle_json, createDefaultCrmLifecycle()),
+    experimentLab: safeJsonParse(baseRow?.experiment_lab_json, createDefaultExperimentLab()),
+    governancePolicy: safeJsonParse(baseRow?.governance_policy_json, createDefaultGovernancePolicy()),
+    snapshots: snapshotRows.map((row) => ({
+      id: String(row?.snapshot_id || ""),
+      label: String(row?.label_text || ""),
+      createdAt: normalizeIsoFromMysql(row?.created_at),
+      createdBy: String(row?.created_by || "System"),
+      summary: String(row?.summary || ""),
+      state: safeJsonParse(row?.state_json, {}),
+    })),
+    approvals: approvalRows.map((row) => ({
+      id: String(row?.approval_id || ""),
+      role: hasText(row?.role_key) ? String(row.role_key) : "strategy_lead",
+      approver: String(row?.approver || ""),
+      signature: String(row?.signature || ""),
+      status: ["pending", "approved", "rejected"].includes(row?.status) ? row.status : "pending",
+      note: hasText(row?.note) ? String(row.note) : "",
+      createdAt: normalizeIsoFromMysql(row?.created_at),
+      updatedAt: normalizeIsoFromMysql(row?.updated_at),
+      approvedAt: row?.approved_at ? normalizeIsoFromMysql(row.approved_at) : undefined,
+    })),
+    auditTrail: auditRows.map((row) => ({
+      id: String(row?.audit_id || ""),
+      action: String(row?.action_key || ""),
+      actor: String(row?.actor || "System"),
+      detail: String(row?.detail || ""),
+      createdAt: normalizeIsoFromMysql(row?.created_at),
+    })),
+  };
+
+  return ensureEnhancedCampaignDefaults(payload);
+}
+
+async function writeCampaignToMysqlConnection(connection, campaign, workspaceId = DEFAULT_WORKSPACE_ID) {
+  const normalizedWorkspace = normalizeWorkspaceId(workspaceId);
+  const sanitized = normalizeCampaign(campaign);
+  const campaignId = sanitized.campaign.id;
+  const workflowStage = ["draft", "review", "approved", "ready_to_launch"].includes(sanitized?.workflow?.stage)
+    ? sanitized.workflow.stage
+    : "draft";
+  const workflowWipLimit = Number.isFinite(Number(sanitized?.workflow?.wipLimit))
+    ? Math.max(1, Math.min(12, Math.round(Number(sanitized.workflow.wipLimit))))
+    : 3;
+
+  await connection.execute(
+    `
+      INSERT INTO campaigns (
+        workspace_id, campaign_id, name, country, languages_json, start_date, end_date, status,
+        workflow_stage, workflow_stage_updated_at, workflow_wip_limit, behavior_statement, behavior_current,
+        behavior_desired, behavior_context, insight_text, insight_evidence_source, insight_confidence_level,
+        driver_types_json, driver_text, driver_why_now, driver_tension, situation, problem, prior_learnings,
+        business_objective, communication_objective, creative_brief_json, content_themes_and_calendar,
+        deliverables_needed, measurement_and_learning_plan, governance_risks_and_approvals, timeline_details,
+        appendices, portfolio_json, template_system_json, digital_ops_json, crm_lifecycle_json,
+        experiment_lab_json, governance_policy_json
+      )
+      VALUES (
+        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+        ?, ?, ?, ?, ?
+      )
+      ON DUPLICATE KEY UPDATE
+        name = VALUES(name),
+        country = VALUES(country),
+        languages_json = VALUES(languages_json),
+        start_date = VALUES(start_date),
+        end_date = VALUES(end_date),
+        status = VALUES(status),
+        workflow_stage = VALUES(workflow_stage),
+        workflow_stage_updated_at = VALUES(workflow_stage_updated_at),
+        workflow_wip_limit = VALUES(workflow_wip_limit),
+        behavior_statement = VALUES(behavior_statement),
+        behavior_current = VALUES(behavior_current),
+        behavior_desired = VALUES(behavior_desired),
+        behavior_context = VALUES(behavior_context),
+        insight_text = VALUES(insight_text),
+        insight_evidence_source = VALUES(insight_evidence_source),
+        insight_confidence_level = VALUES(insight_confidence_level),
+        driver_types_json = VALUES(driver_types_json),
+        driver_text = VALUES(driver_text),
+        driver_why_now = VALUES(driver_why_now),
+        driver_tension = VALUES(driver_tension),
+        situation = VALUES(situation),
+        problem = VALUES(problem),
+        prior_learnings = VALUES(prior_learnings),
+        business_objective = VALUES(business_objective),
+        communication_objective = VALUES(communication_objective),
+        creative_brief_json = VALUES(creative_brief_json),
+        content_themes_and_calendar = VALUES(content_themes_and_calendar),
+        deliverables_needed = VALUES(deliverables_needed),
+        measurement_and_learning_plan = VALUES(measurement_and_learning_plan),
+        governance_risks_and_approvals = VALUES(governance_risks_and_approvals),
+        timeline_details = VALUES(timeline_details),
+        appendices = VALUES(appendices),
+        portfolio_json = VALUES(portfolio_json),
+        template_system_json = VALUES(template_system_json),
+        digital_ops_json = VALUES(digital_ops_json),
+        crm_lifecycle_json = VALUES(crm_lifecycle_json),
+        experiment_lab_json = VALUES(experiment_lab_json),
+        governance_policy_json = VALUES(governance_policy_json),
+        updated_at = CURRENT_TIMESTAMP
+    `,
+    [
+      normalizedWorkspace,
+      campaignId,
+      sanitized.campaign.name || "Untitled Campaign",
+      sanitized.campaign.country || "Tanzania",
+      safeJsonStringify(
+        Array.isArray(sanitized.campaign.languages) ? sanitized.campaign.languages : [],
+        [],
+      ),
+      normalizeDateOnlyForMysql(sanitized.campaign.startDate),
+      normalizeDateOnlyForMysql(sanitized.campaign.endDate),
+      ["draft", "in_review", "final"].includes(sanitized.campaign.status) ? sanitized.campaign.status : "draft",
+      workflowStage,
+      normalizeDateTimeForMysql(sanitized?.workflow?.stageUpdatedAt),
+      workflowWipLimit,
+      sanitized?.behavior?.behaviorStatement || "",
+      sanitized?.behavior?.currentBehavior || "",
+      sanitized?.behavior?.desiredBehavior || "",
+      sanitized?.behavior?.context || "",
+      sanitized?.insight?.insightText || "",
+      sanitized?.insight?.evidenceSource || "",
+      ["low", "medium", "high"].includes(sanitized?.insight?.confidenceLevel)
+        ? sanitized.insight.confidenceLevel
+        : "medium",
+      safeJsonStringify(Array.isArray(sanitized?.driver?.driverTypes) ? sanitized.driver.driverTypes : [], []),
+      sanitized?.driver?.driverText || "",
+      sanitized?.driver?.whyNow || "",
+      sanitized?.driver?.tension || "",
+      sanitized.situation || "",
+      sanitized.problem || "",
+      sanitized.priorLearnings || "",
+      sanitized.businessObjective || "",
+      sanitized.communicationObjective || "",
+      safeJsonStringify(sanitized.creativeBrief || createDefaultCreativeBrief(), createDefaultCreativeBrief()),
+      sanitized.contentThemesAndCalendar || "",
+      sanitized.deliverablesNeeded || "",
+      sanitized.measurementAndLearningPlan || "",
+      sanitized.governanceRisksAndApprovals || "",
+      sanitized.timelineDetails || "",
+      sanitized.appendices || "",
+      safeJsonStringify(sanitized.portfolio || createDefaultPortfolioConfig(), createDefaultPortfolioConfig()),
+      safeJsonStringify(sanitized.templateSystem || createDefaultTemplateSystem(), createDefaultTemplateSystem()),
+      safeJsonStringify(sanitized.digitalOps || createDefaultDigitalOps(), createDefaultDigitalOps()),
+      safeJsonStringify(sanitized.crmLifecycle || createDefaultCrmLifecycle(), createDefaultCrmLifecycle()),
+      safeJsonStringify(sanitized.experimentLab || createDefaultExperimentLab(), createDefaultExperimentLab()),
+      safeJsonStringify(
+        sanitized.governancePolicy || createDefaultGovernancePolicy(),
+        createDefaultGovernancePolicy(),
+      ),
+    ],
+  );
+
+  await deleteCampaignChildrenByCampaign(connection, normalizedWorkspace, campaignId);
+
+  await replaceCampaignChildRows(
+    connection,
+    "campaign_audiences",
+    [
+      "workspace_id",
+      "campaign_id",
+      "audience_id",
+      "priority",
+      "segment_name",
+      "description_text",
+      "barriers",
+      "motivators",
+      "desired_action",
+      "key_message",
+      "support_rtb",
+      "cta",
+      "sort_order",
+    ],
+    (Array.isArray(sanitized.audiences) ? sanitized.audiences : []).map((entry, index) => ({
+      workspace_id: normalizedWorkspace,
+      campaign_id: campaignId,
+      audience_id: hasText(entry?.id) ? String(entry.id) : `aud-${index + 1}`,
+      priority: entry?.priority === "secondary" ? "secondary" : "primary",
+      segment_name: entry?.segmentName || "",
+      description_text: entry?.description || "",
+      barriers: entry?.barriers || "",
+      motivators: entry?.motivators || "",
+      desired_action: entry?.desiredAction || "",
+      key_message: entry?.keyMessage || "",
+      support_rtb: entry?.supportRtb || "",
+      cta: entry?.cta || "",
+      sort_order: index,
+    })),
+  );
+
+  await replaceCampaignChildRows(
+    connection,
+    "campaign_channel_roles",
+    ["workspace_id", "campaign_id", "role_id", "category", "channel", "role_text", "sort_order"],
+    (Array.isArray(sanitized.channelRoles) ? sanitized.channelRoles : []).map((entry, index) => ({
+      workspace_id: normalizedWorkspace,
+      campaign_id: campaignId,
+      role_id: hasText(entry?.id) ? String(entry.id) : `channel-role-${index + 1}`,
+      category: ["paid", "owned", "earned"].includes(entry?.category) ? entry.category : "owned",
+      channel: entry?.channel || "",
+      role_text: entry?.role || "",
+      sort_order: index,
+    })),
+  );
+
+  await replaceCampaignChildRows(
+    connection,
+    "campaign_media_plan_rows",
+    ["workspace_id", "campaign_id", "row_id", "channel", "targeting", "flighting", "budget", "kpi", "benchmark", "sort_order"],
+    (Array.isArray(sanitized.mediaPlanRows) ? sanitized.mediaPlanRows : []).map((entry, index) => ({
+      workspace_id: normalizedWorkspace,
+      campaign_id: campaignId,
+      row_id: hasText(entry?.id) ? String(entry.id) : `media-row-${index + 1}`,
+      channel: entry?.channel || "",
+      targeting: entry?.targeting || "",
+      flighting: entry?.flighting || "",
+      budget: entry?.budget || "",
+      kpi: entry?.kpi || "",
+      benchmark: entry?.benchmark || "",
+      sort_order: index,
+    })),
+  );
+
+  await replaceCampaignChildRows(
+    connection,
+    "campaign_qa_checklist",
+    ["workspace_id", "campaign_id", "item_id", "label_text", "checked_flag", "sort_order"],
+    (Array.isArray(sanitized.qaChecklist) ? sanitized.qaChecklist : []).map((entry, index) => ({
+      workspace_id: normalizedWorkspace,
+      campaign_id: campaignId,
+      item_id: hasText(entry?.id) ? String(entry.id) : `qa-${index + 1}`,
+      label_text: entry?.label || "",
+      checked_flag: entry?.checked ? 1 : 0,
+      sort_order: index,
+    })),
+  );
+
+  await replaceCampaignChildRows(
+    connection,
+    "campaign_ideas",
+    [
+      "workspace_id",
+      "campaign_id",
+      "idea_id",
+      "method",
+      "title",
+      "description_text",
+      "link_to_insight",
+      "link_to_driver",
+      "feasibility_score",
+      "originality_score",
+      "strategic_fit_score",
+      "cultural_fit_score",
+      "selected_flag",
+      "sort_order",
+    ],
+    (Array.isArray(sanitized.ideas) ? sanitized.ideas : []).map((entry, index) => ({
+      workspace_id: normalizedWorkspace,
+      campaign_id: campaignId,
+      idea_id: hasText(entry?.id) ? String(entry.id) : `idea-${index + 1}`,
+      method: entry?.method || "Re-expression",
+      title: entry?.title || "",
+      description_text: entry?.description || "",
+      link_to_insight: entry?.linkToInsight || "",
+      link_to_driver: entry?.linkToDriver || "",
+      feasibility_score: Number(entry?.feasibilityScore || 0),
+      originality_score: Number(entry?.originalityScore || 0),
+      strategic_fit_score: Number(entry?.strategicFitScore || 0),
+      cultural_fit_score: Number(entry?.culturalFitScore || 0),
+      selected_flag: entry?.selected ? 1 : 0,
+      sort_order: index,
+    })),
+  );
+
+  await replaceCampaignChildRows(
+    connection,
+    "campaign_concepts",
+    [
+      "workspace_id",
+      "campaign_id",
+      "concept_id",
+      "name",
+      "big_idea",
+      "smp",
+      "key_promise",
+      "support_points_json",
+      "tone",
+      "selected_idea_ids_json",
+      "channels_json",
+      "risks_json",
+      "tagline",
+      "key_visual_description",
+      "execution_rationale",
+      "behavior_trigger",
+      "board_data_json",
+      "status",
+      "sort_order",
+    ],
+    (Array.isArray(sanitized.concepts) ? sanitized.concepts : []).map((entry, index) => ({
+      workspace_id: normalizedWorkspace,
+      campaign_id: campaignId,
+      concept_id: hasText(entry?.id) ? String(entry.id) : `concept-${index + 1}`,
+      name: entry?.name || "",
+      big_idea: entry?.bigIdea || "",
+      smp: entry?.smp || "",
+      key_promise: entry?.keyPromise || "",
+      support_points_json: safeJsonStringify(Array.isArray(entry?.supportPoints) ? entry.supportPoints : [], []),
+      tone: entry?.tone || "",
+      selected_idea_ids_json: safeJsonStringify(Array.isArray(entry?.selectedIdeaIds) ? entry.selectedIdeaIds : [], []),
+      channels_json: safeJsonStringify(Array.isArray(entry?.channels) ? entry.channels : [], []),
+      risks_json: safeJsonStringify(Array.isArray(entry?.risks) ? entry.risks : [], []),
+      tagline: entry?.tagline || "",
+      key_visual_description: entry?.keyVisualDescription || "",
+      execution_rationale: entry?.executionRationale || "",
+      behavior_trigger: entry?.behaviorTrigger || "",
+      board_data_json: safeJsonStringify(entry?.boardData || {}, {}),
+      status: ["draft", "shortlisted", "final"].includes(entry?.status) ? entry.status : "draft",
+      sort_order: index,
+    })),
+  );
+
+  await replaceCampaignChildRows(
+    connection,
+    "campaign_collaboration_members",
+    ["workspace_id", "campaign_id", "member_name", "sort_order"],
+    (Array.isArray(sanitized?.collaboration?.members) ? sanitized.collaboration.members : []).map((entry, index) => ({
+      workspace_id: normalizedWorkspace,
+      campaign_id: campaignId,
+      member_name: String(entry || "").trim(),
+      sort_order: index,
+    })).filter((entry) => entry.member_name),
+  );
+
+  await replaceCampaignChildRows(
+    connection,
+    "campaign_collaboration_messages",
+    [
+      "workspace_id",
+      "campaign_id",
+      "message_id",
+      "author",
+      "content",
+      "created_at",
+      "mentions_json",
+      "parent_id",
+      "resolved_flag",
+      "resolved_at",
+      "resolved_by",
+      "field_key",
+      "anchor_label",
+      "sort_order",
+    ],
+    (Array.isArray(sanitized?.collaboration?.messages) ? sanitized.collaboration.messages : []).map((entry, index) => ({
+      workspace_id: normalizedWorkspace,
+      campaign_id: campaignId,
+      message_id: hasText(entry?.id) ? String(entry.id) : `msg-${index + 1}`,
+      author: entry?.author || "",
+      content: entry?.content || "",
+      created_at: normalizeDateTimeForMysql(entry?.createdAt),
+      mentions_json: safeJsonStringify(Array.isArray(entry?.mentions) ? entry.mentions : [], []),
+      parent_id: hasText(entry?.parentId) ? String(entry.parentId) : null,
+      resolved_flag: entry?.resolved ? 1 : 0,
+      resolved_at: entry?.resolvedAt ? normalizeDateTimeForMysql(entry.resolvedAt) : null,
+      resolved_by: hasText(entry?.resolvedBy) ? String(entry.resolvedBy) : null,
+      field_key: hasText(entry?.fieldKey) ? String(entry.fieldKey) : null,
+      anchor_label: hasText(entry?.anchorLabel) ? String(entry.anchorLabel) : null,
+      sort_order: index,
+    })),
+  );
+
+  await replaceCampaignChildRows(
+    connection,
+    "campaign_collaboration_presence",
+    ["workspace_id", "campaign_id", "member_name", "field_key", "is_typing", "last_seen_at", "sort_order"],
+    (Array.isArray(sanitized?.collaboration?.presence) ? sanitized.collaboration.presence : []).map((entry, index) => ({
+      workspace_id: normalizedWorkspace,
+      campaign_id: campaignId,
+      member_name: String(entry?.member || "").trim(),
+      field_key: hasText(entry?.fieldKey) ? String(entry.fieldKey) : null,
+      is_typing: entry?.isTyping ? 1 : 0,
+      last_seen_at: normalizeDateTimeForMysql(entry?.lastSeenAt),
+      sort_order: index,
+    })).filter((entry) => entry.member_name),
+  );
+
+  await replaceCampaignChildRows(
+    connection,
+    "campaign_evidence_items",
+    [
+      "workspace_id",
+      "campaign_id",
+      "evidence_id",
+      "section_key",
+      "claim",
+      "source",
+      "source_quality",
+      "confidence",
+      "owner",
+      "url",
+      "created_at",
+      "sort_order",
+    ],
+    (Array.isArray(sanitized.evidenceItems) ? sanitized.evidenceItems : []).map((entry, index) => ({
+      workspace_id: normalizedWorkspace,
+      campaign_id: campaignId,
+      evidence_id: hasText(entry?.id) ? String(entry.id) : `evidence-${index + 1}`,
+      section_key: entry?.section || "research",
+      claim: entry?.claim || "",
+      source: entry?.source || "",
+      source_quality: ["low", "medium", "high"].includes(entry?.sourceQuality) ? entry.sourceQuality : "medium",
+      confidence: ["low", "medium", "high"].includes(entry?.confidence) ? entry.confidence : "medium",
+      owner: hasText(entry?.owner) ? String(entry.owner) : null,
+      url: hasText(entry?.url) ? String(entry.url) : null,
+      created_at: normalizeDateTimeForMysql(entry?.createdAt),
+      sort_order: index,
+    })),
+  );
+
+  await replaceCampaignChildRows(
+    connection,
+    "campaign_issues",
+    [
+      "workspace_id",
+      "campaign_id",
+      "issue_id",
+      "title",
+      "description_text",
+      "severity",
+      "status",
+      "owner",
+      "sla_hours",
+      "created_at",
+      "updated_at",
+      "resolved_at",
+      "postmortem",
+      "sort_order",
+    ],
+    (Array.isArray(sanitized.issues) ? sanitized.issues : []).map((entry, index) => ({
+      workspace_id: normalizedWorkspace,
+      campaign_id: campaignId,
+      issue_id: hasText(entry?.id) ? String(entry.id) : `issue-${index + 1}`,
+      title: entry?.title || "",
+      description_text: entry?.description || "",
+      severity: ["low", "medium", "high", "critical"].includes(entry?.severity) ? entry.severity : "medium",
+      status: ["open", "in_progress", "resolved"].includes(entry?.status) ? entry.status : "open",
+      owner: hasText(entry?.owner) ? String(entry.owner) : "Unassigned",
+      sla_hours: Number.isFinite(Number(entry?.slaHours)) ? Math.max(1, Number(entry.slaHours)) : 48,
+      created_at: normalizeDateTimeForMysql(entry?.createdAt),
+      updated_at: normalizeDateTimeForMysql(entry?.updatedAt),
+      resolved_at: entry?.resolvedAt ? normalizeDateTimeForMysql(entry.resolvedAt) : null,
+      postmortem: hasText(entry?.postmortem) ? String(entry.postmortem) : null,
+      sort_order: index,
+    })),
+  );
+
+  await replaceCampaignChildRows(
+    connection,
+    "campaign_reminders",
+    ["workspace_id", "campaign_id", "reminder_id", "type_key", "severity", "message", "created_at", "due_at", "sort_order"],
+    (Array.isArray(sanitized.reminders) ? sanitized.reminders : []).map((entry, index) => ({
+      workspace_id: normalizedWorkspace,
+      campaign_id: campaignId,
+      reminder_id: hasText(entry?.id) ? String(entry.id) : `reminder-${index + 1}`,
+      type_key: entry?.type || "inactive_concept",
+      severity: ["info", "warning", "critical"].includes(entry?.severity) ? entry.severity : "info",
+      message: entry?.message || "",
+      created_at: normalizeDateTimeForMysql(entry?.createdAt),
+      due_at: entry?.dueAt ? normalizeDateTimeForMysql(entry.dueAt) : null,
+      sort_order: index,
+    })),
+  );
+
+  await replaceCampaignChildRows(
+    connection,
+    "campaign_snapshots",
+    ["workspace_id", "campaign_id", "snapshot_id", "label_text", "created_at", "created_by", "summary", "state_json", "sort_order"],
+    (Array.isArray(sanitized.snapshots) ? sanitized.snapshots : []).map((entry, index) => ({
+      workspace_id: normalizedWorkspace,
+      campaign_id: campaignId,
+      snapshot_id: hasText(entry?.id) ? String(entry.id) : `snapshot-${index + 1}`,
+      label_text: hasText(entry?.label) ? String(entry.label) : "Campaign snapshot",
+      created_at: normalizeDateTimeForMysql(entry?.createdAt),
+      created_by: hasText(entry?.createdBy) ? String(entry.createdBy) : "System",
+      summary: entry?.summary || "",
+      state_json: safeJsonStringify(entry?.state || {}, {}),
+      sort_order: index,
+    })),
+  );
+
+  await replaceCampaignChildRows(
+    connection,
+    "campaign_approvals",
+    [
+      "workspace_id",
+      "campaign_id",
+      "approval_id",
+      "role_key",
+      "approver",
+      "signature",
+      "status",
+      "note",
+      "created_at",
+      "updated_at",
+      "approved_at",
+      "sort_order",
+    ],
+    (Array.isArray(sanitized.approvals) ? sanitized.approvals : []).map((entry, index) => ({
+      workspace_id: normalizedWorkspace,
+      campaign_id: campaignId,
+      approval_id: hasText(entry?.id) ? String(entry.id) : `approval-${index + 1}`,
+      role_key: entry?.role || "strategy_lead",
+      approver: entry?.approver || "",
+      signature: entry?.signature || "",
+      status: ["pending", "approved", "rejected"].includes(entry?.status) ? entry.status : "pending",
+      note: hasText(entry?.note) ? String(entry.note) : null,
+      created_at: normalizeDateTimeForMysql(entry?.createdAt),
+      updated_at: normalizeDateTimeForMysql(entry?.updatedAt),
+      approved_at: entry?.approvedAt ? normalizeDateTimeForMysql(entry.approvedAt) : null,
+      sort_order: index,
+    })),
+  );
+
+  await replaceCampaignChildRows(
+    connection,
+    "campaign_audit_events",
+    ["workspace_id", "campaign_id", "audit_id", "action_key", "actor", "detail", "created_at", "sort_order"],
+    (Array.isArray(sanitized.auditTrail) ? sanitized.auditTrail : []).map((entry, index) => ({
+      workspace_id: normalizedWorkspace,
+      campaign_id: campaignId,
+      audit_id: hasText(entry?.id) ? String(entry.id) : `audit-${index + 1}`,
+      action_key: entry?.action || "",
+      actor: hasText(entry?.actor) ? String(entry.actor) : "System",
+      detail: entry?.detail || "",
+      created_at: normalizeDateTimeForMysql(entry?.createdAt),
+      sort_order: index,
+    })),
+  );
+}
+
+async function migrateLegacyCampaignStateToMysqlNormalizedIfNeeded(workspaceId, pool) {
+  const normalizedWorkspace = normalizeWorkspaceId(workspaceId);
+  if (normalizedCampaignMigrationChecked.has(normalizedWorkspace)) {
+    return;
+  }
+
+  const [countRows] = await pool.execute(
+    "SELECT COUNT(*) AS total FROM campaigns WHERE workspace_id = ?",
+    [normalizedWorkspace],
+  );
+  const total = Number(Array.isArray(countRows) && countRows[0] ? countRows[0].total : 0);
+  if (total > 0) {
+    normalizedCampaignMigrationChecked.add(normalizedWorkspace);
+    return;
+  }
+
+  const legacyStore = await readJsonState(toWorkspaceStateKey(STORE_KEY_CAMPAIGNS, normalizedWorkspace), () => ({
+    ...readStoreFromFile(normalizedWorkspace),
+  }));
+  const legacyCampaigns = Array.isArray(legacyStore?.campaigns) ? legacyStore.campaigns : [];
+  if (legacyCampaigns.length === 0) {
+    normalizedCampaignMigrationChecked.add(normalizedWorkspace);
+    return;
+  }
+
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    for (const candidate of legacyCampaigns) {
+      try {
+        await writeCampaignToMysqlConnection(connection, normalizeCampaign(candidate), normalizedWorkspace);
+      } catch {
+        // Skip malformed legacy records and continue migration for valid entries.
+      }
+    }
+    await connection.commit();
+    normalizedCampaignMigrationChecked.add(normalizedWorkspace);
+  } catch (error) {
+    try {
+      await connection.rollback();
+    } catch {
+      // Ignore rollback errors and rethrow original migration failure.
+    }
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
+
+async function listCampaignsFromMysqlNormalized(workspaceId = DEFAULT_WORKSPACE_ID) {
+  await ensureMysqlSchema();
+  const pool = await getMysqlPool();
+  if (!pool) {
+    return [];
+  }
+  const normalizedWorkspace = normalizeWorkspaceId(workspaceId);
+  await migrateLegacyCampaignStateToMysqlNormalizedIfNeeded(normalizedWorkspace, pool);
+
+  const [campaignRowsRaw] = await pool.execute(
+    "SELECT * FROM campaigns WHERE workspace_id = ? ORDER BY updated_at DESC",
+    [normalizedWorkspace],
+  );
+  const campaignRows = Array.isArray(campaignRowsRaw) ? campaignRowsRaw : [];
+  if (campaignRows.length === 0) {
+    return [];
+  }
+
+  const campaignIds = campaignRows.map((row) => String(row.campaign_id || "")).filter(Boolean);
+  const [
+    audiences,
+    channelRoles,
+    mediaPlanRows,
+    qaChecklist,
+    ideas,
+    concepts,
+    collaborationMembers,
+    collaborationMessages,
+    collaborationPresence,
+    evidenceItems,
+    issues,
+    reminders,
+    snapshots,
+    approvals,
+    auditEvents,
+  ] = await Promise.all([
+    fetchCampaignChildRows(pool, "campaign_audiences", normalizedWorkspace, campaignIds, "sort_order ASC, id ASC"),
+    fetchCampaignChildRows(pool, "campaign_channel_roles", normalizedWorkspace, campaignIds, "sort_order ASC, id ASC"),
+    fetchCampaignChildRows(pool, "campaign_media_plan_rows", normalizedWorkspace, campaignIds, "sort_order ASC, id ASC"),
+    fetchCampaignChildRows(pool, "campaign_qa_checklist", normalizedWorkspace, campaignIds, "sort_order ASC, id ASC"),
+    fetchCampaignChildRows(pool, "campaign_ideas", normalizedWorkspace, campaignIds, "sort_order ASC, id ASC"),
+    fetchCampaignChildRows(pool, "campaign_concepts", normalizedWorkspace, campaignIds, "sort_order ASC, id ASC"),
+    fetchCampaignChildRows(pool, "campaign_collaboration_members", normalizedWorkspace, campaignIds, "sort_order ASC, id ASC"),
+    fetchCampaignChildRows(pool, "campaign_collaboration_messages", normalizedWorkspace, campaignIds, "sort_order ASC, id ASC"),
+    fetchCampaignChildRows(pool, "campaign_collaboration_presence", normalizedWorkspace, campaignIds, "sort_order ASC, id ASC"),
+    fetchCampaignChildRows(pool, "campaign_evidence_items", normalizedWorkspace, campaignIds, "sort_order ASC, id ASC"),
+    fetchCampaignChildRows(pool, "campaign_issues", normalizedWorkspace, campaignIds, "sort_order ASC, id ASC"),
+    fetchCampaignChildRows(pool, "campaign_reminders", normalizedWorkspace, campaignIds, "sort_order ASC, id ASC"),
+    fetchCampaignChildRows(pool, "campaign_snapshots", normalizedWorkspace, campaignIds, "sort_order ASC, id ASC"),
+    fetchCampaignChildRows(pool, "campaign_approvals", normalizedWorkspace, campaignIds, "sort_order ASC, id ASC"),
+    fetchCampaignChildRows(pool, "campaign_audit_events", normalizedWorkspace, campaignIds, "sort_order ASC, id ASC"),
+  ]);
+
+  const grouped = {
+    audiences: groupRowsByCampaignId(audiences),
+    channelRoles: groupRowsByCampaignId(channelRoles),
+    mediaPlanRows: groupRowsByCampaignId(mediaPlanRows),
+    qaChecklist: groupRowsByCampaignId(qaChecklist),
+    ideas: groupRowsByCampaignId(ideas),
+    concepts: groupRowsByCampaignId(concepts),
+    collaborationMembers: groupRowsByCampaignId(collaborationMembers),
+    collaborationMessages: groupRowsByCampaignId(collaborationMessages),
+    collaborationPresence: groupRowsByCampaignId(collaborationPresence),
+    evidenceItems: groupRowsByCampaignId(evidenceItems),
+    issues: groupRowsByCampaignId(issues),
+    reminders: groupRowsByCampaignId(reminders),
+    snapshots: groupRowsByCampaignId(snapshots),
+    approvals: groupRowsByCampaignId(approvals),
+    auditEvents: groupRowsByCampaignId(auditEvents),
+  };
+
+  return campaignRows.map((row) => buildCampaignFromMysqlRow(row, grouped));
+}
+
+async function upsertCampaignInMysqlNormalized(campaign, workspaceId = DEFAULT_WORKSPACE_ID) {
+  await ensureMysqlSchema();
+  const pool = await getMysqlPool();
+  if (!pool) {
+    return normalizeCampaign(campaign);
+  }
+
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    await writeCampaignToMysqlConnection(connection, campaign, workspaceId);
+    await connection.commit();
+  } catch (error) {
+    try {
+      await connection.rollback();
+    } catch {
+      // Ignore rollback errors and rethrow original upsert failure.
+    }
+    throw error;
+  } finally {
+    connection.release();
+  }
+  return normalizeCampaign(campaign);
+}
+
+async function deleteCampaignInMysqlNormalized(campaignId, workspaceId = DEFAULT_WORKSPACE_ID) {
+  await ensureMysqlSchema();
+  const pool = await getMysqlPool();
+  if (!pool) {
+    return false;
+  }
+
+  const normalizedWorkspace = normalizeWorkspaceId(workspaceId);
+  const normalizedCampaignId = String(campaignId || "").trim();
+  if (!normalizedCampaignId) {
+    return false;
+  }
+
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    await deleteCampaignChildrenByCampaign(connection, normalizedWorkspace, normalizedCampaignId);
+    const [result] = await connection.execute(
+      "DELETE FROM campaigns WHERE workspace_id = ? AND campaign_id = ?",
+      [normalizedWorkspace, normalizedCampaignId],
+    );
+    await connection.commit();
+    return Number(result?.affectedRows || 0) > 0;
+  } catch (error) {
+    try {
+      await connection.rollback();
+    } catch {
+      // Ignore rollback errors and rethrow original delete failure.
+    }
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
+
+async function replaceWorkspaceCampaignsInMysqlNormalized(campaigns, workspaceId = DEFAULT_WORKSPACE_ID) {
+  await ensureMysqlSchema();
+  const pool = await getMysqlPool();
+  if (!pool) {
+    return;
+  }
+  const normalizedWorkspace = normalizeWorkspaceId(workspaceId);
+
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    await deleteCampaignChildrenByWorkspace(connection, normalizedWorkspace);
+    await connection.execute("DELETE FROM campaigns WHERE workspace_id = ?", [normalizedWorkspace]);
+    for (const campaign of Array.isArray(campaigns) ? campaigns : []) {
+      await writeCampaignToMysqlConnection(connection, campaign, normalizedWorkspace);
+    }
+    await connection.commit();
+  } catch (error) {
+    try {
+      await connection.rollback();
+    } catch {
+      // Ignore rollback errors and rethrow original replacement failure.
+    }
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
+
 function readStoreFromFile(workspaceId = DEFAULT_WORKSPACE_ID) {
   const workspaceStorePath = getWorkspaceStorePath(workspaceId);
   try {
@@ -1212,6 +3108,9 @@ async function writeStore(store, workspaceId = DEFAULT_WORKSPACE_ID) {
 }
 
 async function listCampaigns(workspaceId = DEFAULT_WORKSPACE_ID) {
+  if (isMysqlNormalizedCampaignStorageEnabled()) {
+    return listCampaignsFromMysqlNormalized(workspaceId);
+  }
   return (await readStore(workspaceId)).campaigns.map(clone);
 }
 
@@ -1220,6 +3119,21 @@ async function getCampaignById(id, workspaceId = DEFAULT_WORKSPACE_ID) {
 }
 
 async function upsertCampaign(campaign, workspaceId = DEFAULT_WORKSPACE_ID) {
+  if (isMysqlNormalizedCampaignStorageEnabled()) {
+    const sanitized = normalizeCampaign(campaign);
+    const id = sanitized.campaign.id;
+    const existing = await getCampaignById(id, workspaceId);
+    await upsertCampaignInMysqlNormalized(sanitized, workspaceId);
+    broadcastRealtimeEvent(workspaceId, {
+      entity: "campaign",
+      action: existing ? "updated" : "created",
+      campaignId: id,
+      timestamp: nowIso(),
+    });
+    await rebuildWorkspaceNotifications(workspaceId);
+    return sanitized;
+  }
+
   const sanitized = normalizeCampaign(campaign);
   const store = await readStore(workspaceId);
   const id = sanitized.campaign.id;
@@ -1243,6 +3157,20 @@ async function upsertCampaign(campaign, workspaceId = DEFAULT_WORKSPACE_ID) {
 }
 
 async function deleteCampaign(id, workspaceId = DEFAULT_WORKSPACE_ID) {
+  if (isMysqlNormalizedCampaignStorageEnabled()) {
+    const deleted = await deleteCampaignInMysqlNormalized(id, workspaceId);
+    if (deleted) {
+      broadcastRealtimeEvent(workspaceId, {
+        entity: "campaign",
+        action: "deleted",
+        campaignId: id,
+        timestamp: nowIso(),
+      });
+      await rebuildWorkspaceNotifications(workspaceId);
+    }
+    return deleted;
+  }
+
   const store = await readStore(workspaceId);
   const before = store.campaigns.length;
   store.campaigns = store.campaigns.filter((campaign) => campaign.campaign.id !== id);
@@ -1326,6 +3254,62 @@ function getUnresolvedCommentCount(campaign) {
   return messages.filter((message) => !message?.parentId && !message?.resolved).length;
 }
 
+function normalizeNotificationCreatedAt(value) {
+  const parsed = Date.parse(String(value || ""));
+  if (!Number.isFinite(parsed)) {
+    return nowIso();
+  }
+  return new Date(parsed).toISOString();
+}
+
+function computeCollaborationNotifications(campaign) {
+  const campaignId = campaign?.campaign?.id || "campaign";
+  const campaignTitle = campaign?.campaign?.name || "Campaign";
+  const messages = Array.isArray(campaign?.collaboration?.messages)
+    ? campaign.collaboration.messages
+    : [];
+
+  const sorted = [...messages]
+    .filter((entry) => entry && hasText(entry.id) && hasText(entry.content))
+    .sort((a, b) => {
+      const aMs = Date.parse(a.createdAt || "");
+      const bMs = Date.parse(b.createdAt || "");
+      if (!Number.isFinite(aMs) && !Number.isFinite(bMs)) {
+        return 0;
+      }
+      if (!Number.isFinite(aMs)) {
+        return 1;
+      }
+      if (!Number.isFinite(bMs)) {
+        return -1;
+      }
+      return bMs - aMs;
+    });
+
+  return sorted.slice(0, 8).map((entry) => {
+    const mentions = Array.isArray(entry.mentions)
+      ? entry.mentions.map((name) => String(name || "").trim()).filter(Boolean)
+      : [];
+    const mentionSuffix =
+      mentions.length > 0 ? ` Mentions: ${mentions.slice(0, 3).join(", ")}.` : "";
+    const isReply = hasText(entry.parentId);
+    const isOpenThread = !isReply && !entry.resolved;
+    const actor = hasText(entry.author) ? String(entry.author) : "Team member";
+    const headline = isReply ? "Reply" : "Comment";
+
+    return {
+      id: `${campaignId}:collab-${entry.id}`,
+      campaignId,
+      title: campaignTitle,
+      message: `${headline} by ${actor}: ${compactText(entry.content, 120)}${
+        isOpenThread ? " Open thread." : ""
+      }${mentionSuffix}`,
+      severity: mentions.length > 0 || isOpenThread ? "warning" : "info",
+      createdAt: normalizeNotificationCreatedAt(entry.createdAt),
+    };
+  });
+}
+
 function getOverdueIssueCount(campaign) {
   const issues = Array.isArray(campaign?.issues) ? campaign.issues : [];
   const nowMs = Date.now();
@@ -1387,7 +3371,54 @@ function computeRiskHeatmap(campaign) {
   ];
 }
 
+function getApprovedApprovals(campaign) {
+  return Array.isArray(campaign?.approvals)
+    ? campaign.approvals.filter((entry) => entry?.status === "approved")
+    : [];
+}
+
+function evaluateGovernanceApprovalGate(campaign) {
+  const defaultPolicy = createDefaultGovernancePolicy();
+  const policy =
+    campaign?.governancePolicy && typeof campaign.governancePolicy === "object"
+      ? { ...defaultPolicy, ...campaign.governancePolicy }
+      : defaultPolicy;
+  const validRoles = new Set(["strategy_lead", "creative_lead", "client_partner", "compliance"]);
+  const requiredApprovalRoles = Array.isArray(policy.requiredApprovalRoles)
+    ? policy.requiredApprovalRoles.filter((role) => validRoles.has(role))
+    : defaultPolicy.requiredApprovalRoles;
+  const requiredRoles = requiredApprovalRoles.length > 0
+    ? requiredApprovalRoles
+    : defaultPolicy.requiredApprovalRoles;
+  const minApprovedCountRaw = Number(policy.minApprovedCount);
+  const minApprovedCount = Number.isFinite(minApprovedCountRaw)
+    ? Math.max(0, Math.min(10, Math.round(minApprovedCountRaw)))
+    : defaultPolicy.minApprovedCount;
+  const approved = getApprovedApprovals(campaign);
+  const approvedRoles = new Set(
+    approved
+      .map((entry) => (hasText(entry?.role) ? String(entry.role).trim() : ""))
+      .filter((role) => validRoles.has(role)),
+  );
+  const missingRoles = requiredRoles.filter((role) => !approvedRoles.has(role));
+  const passed = approved.length >= minApprovedCount && missingRoles.length === 0;
+
+  return {
+    policy,
+    requiredRoles,
+    minApprovedCount,
+    approvedCount: approved.length,
+    missingRoles,
+    passed,
+  };
+}
+
 function computePreflightChecks(campaign) {
+  const approvalGate = evaluateGovernanceApprovalGate(campaign);
+  const approvalRecommendation =
+    approvalGate.missingRoles.length > 0
+      ? `Capture approved signatures for roles: ${approvalGate.missingRoles.join(", ")}.`
+      : `Capture at least ${approvalGate.minApprovedCount} approved signature(s).`;
   const checks = [
     {
       id: "objective_defined",
@@ -1431,11 +3462,9 @@ function computePreflightChecks(campaign) {
     {
       id: "approval_signed",
       label: "Role-based approval signature captured",
-      passed:
-        Array.isArray(campaign?.approvals) &&
-        campaign.approvals.some((entry) => entry?.status === "approved"),
+      passed: approvalGate.passed,
       severity: "critical",
-      recommendation: "Capture approval from at least one mandatory role.",
+      recommendation: approvalRecommendation,
     },
     {
       id: "critical_incidents",
@@ -1482,46 +3511,91 @@ function buildCampaignHealth(campaign) {
 function computeCampaignReminders(campaign) {
   const reminders = [];
   const nowMs = Date.now();
-
-  const concepts = Array.isArray(campaign?.concepts) ? campaign.concepts : [];
-  for (const concept of concepts) {
-    const lastTouch = concept?.boardData?.updatedAt || campaign?.workflow?.stageUpdatedAt || campaign?.campaign?.startDate;
-    const touchedAtMs = Date.parse(lastTouch || "");
-    if (!Number.isFinite(touchedAtMs)) {
+  const automationRules = Array.isArray(campaign?.crmLifecycle?.automationRules)
+    ? campaign.crmLifecycle.automationRules
+    : [];
+  const rulesByTrigger = new Map();
+  for (const rule of automationRules) {
+    const trigger = hasText(rule?.trigger) ? String(rule.trigger).trim() : "";
+    if (!trigger || rulesByTrigger.has(trigger)) {
       continue;
     }
-    if (nowMs - touchedAtMs > 72 * 60 * 60 * 1000) {
-      reminders.push({
-        id: `rem-${concept.id}-inactive`,
-        type: "inactive_concept",
-        severity: "warning",
-        message: `Concept "${concept.name || concept.id}" has been inactive for over 72 hours.`,
-        createdAt: nowIso(),
-      });
+    rulesByTrigger.set(trigger, rule);
+  }
+
+  const inactivityRule = rulesByTrigger.get("no_activity_72h");
+  const unresolvedMentionRule = rulesByTrigger.get("unresolved_comment_24h");
+  const conceptInactivityEnabled = inactivityRule ? inactivityRule.active !== false : true;
+  const unresolvedMentionEnabled = unresolvedMentionRule ? unresolvedMentionRule.active !== false : true;
+
+  const concepts = Array.isArray(campaign?.concepts) ? campaign.concepts : [];
+  if (conceptInactivityEnabled) {
+    for (const concept of concepts) {
+      const lastTouch = concept?.boardData?.updatedAt || campaign?.workflow?.stageUpdatedAt || campaign?.campaign?.startDate;
+      const touchedAtMs = Date.parse(lastTouch || "");
+      if (!Number.isFinite(touchedAtMs)) {
+        continue;
+      }
+      if (nowMs - touchedAtMs > 72 * 60 * 60 * 1000) {
+        reminders.push({
+          id: `rem-${concept.id}-inactive`,
+          type: "inactive_concept",
+          severity: "warning",
+          message: `Concept "${concept.name || concept.id}" has been inactive for over 72 hours.`,
+          createdAt: nowIso(),
+          dueAt: new Date(
+            touchedAtMs + Math.max(1, Number(inactivityRule?.slaHours) || 24) * 60 * 60 * 1000,
+          ).toISOString(),
+        });
+      }
     }
   }
 
   const messages = Array.isArray(campaign?.collaboration?.messages)
     ? campaign.collaboration.messages
     : [];
-  for (const message of messages) {
-    if (message?.parentId || message?.resolved) {
+  if (unresolvedMentionEnabled) {
+    for (const message of messages) {
+      if (message?.parentId || message?.resolved) {
+        continue;
+      }
+      const createdAtMs = Date.parse(message.createdAt || "");
+      if (!Number.isFinite(createdAtMs)) {
+        continue;
+      }
+      if (nowMs - createdAtMs > 24 * 60 * 60 * 1000) {
+        reminders.push({
+          id: `rem-${message.id}-mention`,
+          type: "unresolved_mention",
+          severity: "warning",
+          message: `Unresolved team thread by ${message.author} is older than 24 hours.`,
+          createdAt: nowIso(),
+          dueAt: new Date(
+            createdAtMs + Math.max(1, Number(unresolvedMentionRule?.slaHours) || 12) * 60 * 60 * 1000,
+          ).toISOString(),
+        });
+      }
+    }
+  }
+
+  const crmSegments = Array.isArray(campaign?.crmLifecycle?.segments)
+    ? campaign.crmLifecycle.segments
+    : [];
+  for (let index = 0; index < crmSegments.length; index += 1) {
+    const segment = crmSegments[index];
+    const dueAtMs = Date.parse(segment?.dueAt || "");
+    if (!Number.isFinite(dueAtMs) || dueAtMs > nowMs || !hasText(segment?.nextAction)) {
       continue;
     }
-    const createdAtMs = Date.parse(message.createdAt || "");
-    if (!Number.isFinite(createdAtMs)) {
-      continue;
-    }
-    if (nowMs - createdAtMs > 24 * 60 * 60 * 1000) {
-      reminders.push({
-        id: `rem-${message.id}-mention`,
-        type: "unresolved_mention",
-        severity: "warning",
-        message: `Unresolved team thread by ${message.author} is older than 24 hours.`,
-        createdAt: nowIso(),
-        dueAt: new Date(createdAtMs + 24 * 60 * 60 * 1000).toISOString(),
-      });
-    }
+    const priority = hasText(segment?.priority) ? String(segment.priority).trim().toLowerCase() : "medium";
+    reminders.push({
+      id: `rem-crm-${hasText(segment?.id) ? segment.id : `seg-${index + 1}`}-due`,
+      type: "segment_due_action",
+      severity: priority === "high" ? "warning" : "info",
+      message: `CRM segment "${segment?.name || `Segment ${index + 1}`}" is overdue: ${segment.nextAction}.`,
+      createdAt: nowIso(),
+      dueAt: new Date(dueAtMs).toISOString(),
+    });
   }
 
   const issues = Array.isArray(campaign?.issues) ? campaign.issues : [];
@@ -1656,9 +3730,19 @@ async function rebuildWorkspaceNotifications(workspaceId = DEFAULT_WORKSPACE_ID)
         createdAt: reminder.createdAt || nowIso(),
       });
     }
+
+    const collaborationItems = computeCollaborationNotifications(campaign).slice(0, 8);
+    for (const entry of collaborationItems) {
+      items.push(entry);
+    }
   }
-  items.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
-  workspaceNotifications.set(normalizeWorkspaceId(workspaceId), items.slice(0, 200));
+  const deduped = new Map();
+  for (const item of items) {
+    deduped.set(item.id, item);
+  }
+  const normalizedItems = [...deduped.values()];
+  normalizedItems.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+  workspaceNotifications.set(normalizeWorkspaceId(workspaceId), normalizedItems.slice(0, 200));
   return workspaceNotifications.get(normalizeWorkspaceId(workspaceId)) || [];
 }
 
@@ -1708,6 +3792,19 @@ async function importCampaigns(raw, mode = "merge", workspaceId = DEFAULT_WORKSP
     }
   }
 
+  if (isMysqlNormalizedCampaignStorageEnabled()) {
+    if (mode === "replace") {
+      await replaceWorkspaceCampaignsInMysqlNormalized(valid, workspaceId);
+      await rebuildWorkspaceNotifications(workspaceId);
+      return { imported: valid.length, skipped, mode };
+    }
+    for (const item of valid) {
+      await upsertCampaignInMysqlNormalized(item, workspaceId);
+    }
+    await rebuildWorkspaceNotifications(workspaceId);
+    return { imported: valid.length, skipped, mode };
+  }
+
   if (mode === "replace") {
     await writeStore({ campaigns: valid }, workspaceId);
     return { imported: valid.length, skipped, mode };
@@ -1724,6 +3821,11 @@ async function importCampaigns(raw, mode = "merge", workspaceId = DEFAULT_WORKSP
 
 async function resetCampaigns(workspaceId = DEFAULT_WORKSPACE_ID) {
   const sample = createDefaultCampaignData({ name: "Default Campaign" });
+  if (isMysqlNormalizedCampaignStorageEnabled()) {
+    await replaceWorkspaceCampaignsInMysqlNormalized([sample], workspaceId);
+    await rebuildWorkspaceNotifications(workspaceId);
+    return [sample];
+  }
   await writeStore({ campaigns: [sample] }, workspaceId);
   return [sample];
 }
@@ -5231,6 +7333,21 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === "POST" && pathname === "/api/system/refresh-signal") {
+      const body = await readRequestJson(req);
+      const reason = hasText(body?.reason) ? String(body.reason).trim() : "System requested refresh";
+      const source = hasText(body?.source) ? String(body.source).trim() : "system";
+      const delayMs = body?.delayMs;
+      const result = broadcastRefreshSignal(reason, source, delayMs);
+      sendJson(req, res, 200, {
+        success: true,
+        connectedClients: result.connected,
+        deliveredClients: result.sent,
+        signal: result.payload,
+      });
+      return;
+    }
+
     if (req.method === "GET" && pathname === "/api/realtime/stream") {
       openRealtimeStream(req, res, url);
       return;
@@ -5664,6 +7781,44 @@ const server = createServer(async (req, res) => {
         }
       }
 
+      if (nextStage === "ready_to_launch") {
+        const governance = evaluateGovernanceApprovalGate(campaign);
+        if (governance.policy.requirePreflightPassForReady) {
+          const preflight = computePreflightChecks(campaign);
+          if (!preflight.passed) {
+            sendJson(req, res, 409, {
+              error: `Preflight blocked: score ${preflight.score} is below threshold ${preflight.passThreshold}.`,
+              details: preflight.checks.filter((check) => !check.passed),
+            });
+            return;
+          }
+        }
+
+        if (governance.policy.requireNoCriticalIncidentsForReady) {
+          const criticalOpenIssues = Array.isArray(campaign?.issues)
+            ? campaign.issues.filter((entry) => entry?.severity === "critical" && entry?.status !== "resolved")
+            : [];
+          if (criticalOpenIssues.length > 0) {
+            sendJson(req, res, 409, {
+              error: `Critical incident gate blocked: ${criticalOpenIssues.length} critical incident(s) unresolved.`,
+            });
+            return;
+          }
+        }
+
+        if (!governance.passed) {
+          sendJson(req, res, 409, {
+            error: "Approval gate blocked: governance policy requirements are not yet met.",
+            details: {
+              approvedCount: governance.approvedCount,
+              minApprovedCount: governance.minApprovedCount,
+              missingRoles: governance.missingRoles,
+            },
+          });
+          return;
+        }
+      }
+
       campaign.workflow = {
         ...(campaign.workflow || {}),
         stage: nextStage,
@@ -5729,7 +7884,7 @@ const server = createServer(async (req, res) => {
     }
 
     const incidentItemMatch = pathname.match(/^\/api\/campaigns\/([^/]+)\/incidents\/([^/]+)$/);
-    if (incidentItemMatch && req.method === "PATCH") {
+    if (incidentItemMatch) {
       const campaignId = decodeURIComponent(incidentItemMatch[1]);
       const issueId = decodeURIComponent(incidentItemMatch[2]);
       const workspaceId = getRequestWorkspaceId(req);
@@ -5746,38 +7901,54 @@ const server = createServer(async (req, res) => {
         return;
       }
 
-      const body = await readRequestJson(req);
-      const current = issues[index];
-      const nextStatus = ["open", "in_progress", "resolved"].includes(body?.status)
-        ? body.status
-        : current.status;
-      const nextSeverity = ["low", "medium", "high", "critical"].includes(body?.severity)
-        ? body.severity
-        : current.severity;
-      const updated = {
-        ...current,
-        status: nextStatus,
-        severity: nextSeverity,
-        owner: hasText(body?.owner) ? String(body.owner).trim() : current.owner,
-        postmortem:
-          typeof body?.postmortem === "string" && body.postmortem.trim()
-            ? body.postmortem.trim()
-            : current.postmortem,
-        updatedAt: nowIso(),
-        resolvedAt: nextStatus === "resolved" ? nowIso() : undefined,
-      };
+      if (req.method === "PATCH") {
+        const body = await readRequestJson(req);
+        const current = issues[index];
+        const nextStatus = ["open", "in_progress", "resolved"].includes(body?.status)
+          ? body.status
+          : current.status;
+        const nextSeverity = ["low", "medium", "high", "critical"].includes(body?.severity)
+          ? body.severity
+          : current.severity;
+        const updated = {
+          ...current,
+          status: nextStatus,
+          severity: nextSeverity,
+          owner: hasText(body?.owner) ? String(body.owner).trim() : current.owner,
+          postmortem:
+            typeof body?.postmortem === "string" && body.postmortem.trim()
+              ? body.postmortem.trim()
+              : current.postmortem,
+          updatedAt: nowIso(),
+          resolvedAt: nextStatus === "resolved" ? nowIso() : undefined,
+        };
 
-      issues[index] = updated;
-      campaign.issues = issues;
-      appendCampaignAuditEvent(
-        campaign,
-        "incident_updated",
-        hasText(updated.owner) ? updated.owner : "System",
-        `Issue ${updated.title} moved to ${updated.status}.`,
-      );
-      await upsertCampaign(campaign, workspaceId);
-      sendJson(req, res, 200, updated);
-      return;
+        issues[index] = updated;
+        campaign.issues = issues;
+        appendCampaignAuditEvent(
+          campaign,
+          "incident_updated",
+          hasText(updated.owner) ? updated.owner : "System",
+          `Issue ${updated.title} moved to ${updated.status}.`,
+        );
+        await upsertCampaign(campaign, workspaceId);
+        sendJson(req, res, 200, updated);
+        return;
+      }
+
+      if (req.method === "DELETE") {
+        const removed = issues[index];
+        campaign.issues = issues.filter((entry) => entry.id !== issueId);
+        appendCampaignAuditEvent(
+          campaign,
+          "incident_deleted",
+          hasText(removed?.owner) ? removed.owner : "System",
+          `Issue removed: ${removed?.title || issueId}.`,
+        );
+        await upsertCampaign(campaign, workspaceId);
+        sendJson(req, res, 200, { deleted: true });
+        return;
+      }
     }
 
     const remindersMatch = pathname.match(/^\/api\/campaigns\/([^/]+)\/reminders$/);
@@ -5856,6 +8027,34 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    const versionItemMatch = pathname.match(/^\/api\/campaigns\/([^/]+)\/versions\/([^/]+)$/);
+    if (versionItemMatch && req.method === "DELETE") {
+      const campaignId = decodeURIComponent(versionItemMatch[1]);
+      const snapshotId = decodeURIComponent(versionItemMatch[2]);
+      const workspaceId = getRequestWorkspaceId(req);
+      const campaign = await getCampaignById(campaignId, workspaceId);
+      if (!campaign) {
+        sendJson(req, res, 404, { error: "Campaign not found" });
+        return;
+      }
+      const snapshots = Array.isArray(campaign.snapshots) ? campaign.snapshots : [];
+      const existing = snapshots.find((entry) => entry.id === snapshotId);
+      if (!existing) {
+        sendJson(req, res, 404, { error: "Snapshot not found" });
+        return;
+      }
+      campaign.snapshots = snapshots.filter((entry) => entry.id !== snapshotId);
+      appendCampaignAuditEvent(
+        campaign,
+        "snapshot_deleted",
+        "System",
+        `Snapshot removed: ${existing.label}.`,
+      );
+      await upsertCampaign(campaign, workspaceId);
+      sendJson(req, res, 200, { deleted: true });
+      return;
+    }
+
     const approvalsCollectionMatch = pathname.match(/^\/api\/campaigns\/([^/]+)\/approvals$/);
     if (approvalsCollectionMatch) {
       const id = decodeURIComponent(approvalsCollectionMatch[1]);
@@ -5912,7 +8111,7 @@ const server = createServer(async (req, res) => {
     }
 
     const approvalItemMatch = pathname.match(/^\/api\/campaigns\/([^/]+)\/approvals\/([^/]+)$/);
-    if (approvalItemMatch && req.method === "PATCH") {
+    if (approvalItemMatch) {
       const campaignId = decodeURIComponent(approvalItemMatch[1]);
       const approvalId = decodeURIComponent(approvalItemMatch[2]);
       const workspaceId = getRequestWorkspaceId(req);
@@ -5927,31 +8126,48 @@ const server = createServer(async (req, res) => {
         sendJson(req, res, 404, { error: "Approval not found" });
         return;
       }
-      const body = await readRequestJson(req);
-      const current = approvals[index];
-      const status = ["pending", "approved", "rejected"].includes(body?.status)
-        ? body.status
-        : current.status;
-      const updated = {
-        ...current,
-        approver: hasText(body?.approver) ? String(body.approver).trim() : current.approver,
-        signature: hasText(body?.signature) ? String(body.signature).trim() : current.signature,
-        status,
-        note: typeof body?.note === "string" ? body.note : current.note,
-        updatedAt: nowIso(),
-        approvedAt: status === "approved" ? nowIso() : undefined,
-      };
-      approvals[index] = updated;
-      campaign.approvals = approvals;
-      appendCampaignAuditEvent(
-        campaign,
-        "approval_updated",
-        updated.approver || "System",
-        `Approval ${updated.role} moved to ${updated.status}.`,
-      );
-      await upsertCampaign(campaign, workspaceId);
-      sendJson(req, res, 200, updated);
-      return;
+
+      if (req.method === "PATCH") {
+        const body = await readRequestJson(req);
+        const current = approvals[index];
+        const status = ["pending", "approved", "rejected"].includes(body?.status)
+          ? body.status
+          : current.status;
+        const updated = {
+          ...current,
+          approver: hasText(body?.approver) ? String(body.approver).trim() : current.approver,
+          signature: hasText(body?.signature) ? String(body.signature).trim() : current.signature,
+          status,
+          note: typeof body?.note === "string" ? body.note : current.note,
+          updatedAt: nowIso(),
+          approvedAt: status === "approved" ? nowIso() : undefined,
+        };
+        approvals[index] = updated;
+        campaign.approvals = approvals;
+        appendCampaignAuditEvent(
+          campaign,
+          "approval_updated",
+          updated.approver || "System",
+          `Approval ${updated.role} moved to ${updated.status}.`,
+        );
+        await upsertCampaign(campaign, workspaceId);
+        sendJson(req, res, 200, updated);
+        return;
+      }
+
+      if (req.method === "DELETE") {
+        const removed = approvals[index];
+        campaign.approvals = approvals.filter((entry) => entry.id !== approvalId);
+        appendCampaignAuditEvent(
+          campaign,
+          "approval_deleted",
+          hasText(removed?.approver) ? removed.approver : "System",
+          `Approval removed: ${removed?.role || approvalId}.`,
+        );
+        await upsertCampaign(campaign, workspaceId);
+        sendJson(req, res, 200, { deleted: true });
+        return;
+      }
     }
 
     const campaignIdMatch = pathname.match(/^\/api\/campaigns\/([^/]+)$/);
@@ -6010,6 +8226,46 @@ const server = createServer(async (req, res) => {
     });
     sendJson(req, res, 500, { error: message });
   }
+});
+
+server.on("upgrade", (req, socket, head) => {
+  if (!req.url) {
+    socket.destroy();
+    return;
+  }
+
+  let url;
+  try {
+    url = new URL(req.url, `http://localhost:${PORT}`);
+  } catch {
+    socket.destroy();
+    return;
+  }
+
+  if (url.pathname !== REFRESH_SIGNAL_WS_PATH) {
+    socket.destroy();
+    return;
+  }
+
+  const origin = getRequestOrigin(req);
+  if (!isOriginAllowed(origin)) {
+    socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
+    socket.destroy();
+    return;
+  }
+
+  if (!isAuthorizedRealtimeRequest(req, url)) {
+    socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
+    socket.destroy();
+    return;
+  }
+
+  const workspaceId = normalizeWorkspaceId(url.searchParams.get("workspaceId") || getRequestWorkspaceId(req));
+  knownWorkspaceIds.add(workspaceId);
+
+  refreshSignalSocketServer.handleUpgrade(req, socket, head, (websocket) => {
+    registerRefreshSignalWebSocket(websocket, req, url);
+  });
 });
 
 await ensureSeed();

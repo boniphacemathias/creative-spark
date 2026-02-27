@@ -27,6 +27,7 @@ import { useAppWorkspace } from "@/hooks/use-app-workspace";
 import { recordCampaignVisit } from "@/lib/recent-campaigns";
 import { KeyboardShortcutsDialog } from "@/components/KeyboardShortcutsDialog";
 import { useWorkspaceNotifications } from "@/hooks/use-workspace-notifications";
+import { ThemeToggle } from "@/components/ThemeToggle";
 
 function formatRelativeTime(value: string) {
   const timestamp = new Date(value);
@@ -143,6 +144,7 @@ export function AppLayout() {
             <div className="flex items-center gap-2">
               <AppCommandPalette campaigns={campaigns} />
               <KeyboardShortcutsDialog />
+              <ThemeToggle />
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
                   <Button type="button" variant="ghost" size="icon" className="relative">
@@ -156,7 +158,7 @@ export function AppLayout() {
                 <DropdownMenuContent align="end" className="w-80">
                   {notifications.length > 0 && (
                     <DropdownMenuItem disabled className="text-[10px] uppercase tracking-wide text-muted-foreground">
-                      Reminders
+                      Notifications
                     </DropdownMenuItem>
                   )}
                   {notifications.map((item) => (

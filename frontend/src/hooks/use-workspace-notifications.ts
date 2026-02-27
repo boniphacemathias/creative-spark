@@ -19,7 +19,7 @@ export function useWorkspaceNotifications(limit = 20) {
   useEffect(() => {
     const unsubscribe = subscribeRealtimeStream({
       onUpdate: (payload) => {
-        if (payload.entity !== "notification") {
+        if (payload.entity !== "notification" && payload.entity !== "campaign") {
           return;
         }
         void load();

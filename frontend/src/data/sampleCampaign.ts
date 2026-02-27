@@ -293,6 +293,120 @@ export const sampleCampaignData: CampaignData = {
       risk: 0.1,
     },
   },
+  templateSystem: {
+    selectedTemplateId: "template-awareness",
+    availableTemplates: [
+      {
+        id: "template-awareness",
+        name: "Awareness Launch",
+        industry: "Brand",
+        objectiveType: "awareness",
+        defaultSections: ["research", "communication_brief", "creative_brief", "concept_board"],
+        localizationHints: ["language", "symbols", "social_norms"],
+      },
+      {
+        id: "template-conversion",
+        name: "Behavior Conversion",
+        industry: "Behavior Change",
+        objectiveType: "conversion",
+        defaultSections: ["research", "ideation", "concept_development", "prototype"],
+        localizationHints: ["barriers", "motivators", "trusted_voices"],
+      },
+    ],
+    localization: {
+      language: "English",
+      tone: "Community-first and practical",
+      culturalMustInclude: ["Local elder endorsement", "Community market references"],
+      culturalMustAvoid: ["Clinical fear framing"],
+    },
+  },
+  digitalOps: {
+    attributionModel: "weighted_multi_touch",
+    channelSlaHours: [
+      { channel: "WhatsApp", firstResponseHours: 1, followUpHours: 24 },
+      { channel: "Email", firstResponseHours: 6, followUpHours: 48 },
+      { channel: "Social", firstResponseHours: 4, followUpHours: 24 },
+    ],
+    channelMetrics: [
+      {
+        id: "metric-1",
+        channel: "WhatsApp",
+        metric: "Message reply rate",
+        value: "32%",
+        period: "Last 7 days",
+      },
+      {
+        id: "metric-2",
+        channel: "Community radio",
+        metric: "Estimated reach",
+        value: "1.2M",
+        period: "Current flight",
+      },
+    ],
+  },
+  crmLifecycle: {
+    memberRetentionTarget: 0.64,
+    segments: [
+      {
+        id: "crm-new",
+        name: "New Mothers",
+        lifecycleStage: "onboard",
+        size: 4300,
+        priority: "high",
+        nextAction: "Trigger dose-2 reminder sequence",
+        dueAt: "2026-02-20T09:00:00.000Z",
+        owner: "CRM Manager",
+      },
+      {
+        id: "crm-elders",
+        name: "Elder Influencers",
+        lifecycleStage: "retain",
+        size: 1200,
+        priority: "medium",
+        nextAction: "Share endorsement audio pack",
+        dueAt: "2026-02-26T11:00:00.000Z",
+        owner: "Community Lead",
+      },
+    ],
+    automationRules: [
+      {
+        id: "rule-inactive-72h",
+        trigger: "no_activity_72h",
+        action: "send_reengagement_nudge",
+        slaHours: 24,
+        active: true,
+      },
+      {
+        id: "rule-unresolved-24h",
+        trigger: "unresolved_comment_24h",
+        action: "notify_owner",
+        slaHours: 12,
+        active: true,
+      },
+    ],
+  },
+  experimentLab: {
+    experiments: [
+      {
+        id: "exp-1",
+        name: "Shield vs Growth framing",
+        hypothesis: "Growth framing improves completion intent among first-time mothers.",
+        metric: "Intent uplift",
+        baseline: 0.42,
+        target: 0.55,
+        status: "running",
+        winnerConceptId: "concept-1",
+        startDate: "2026-02-10T08:00:00.000Z",
+      },
+    ],
+    promoteWinnerConceptId: "concept-1",
+  },
+  governancePolicy: {
+    requiredApprovalRoles: ["strategy_lead", "creative_lead", "client_partner"],
+    minApprovedCount: 2,
+    requirePreflightPassForReady: true,
+    requireNoCriticalIncidentsForReady: true,
+  },
   snapshots: [],
   approvals: [
     {

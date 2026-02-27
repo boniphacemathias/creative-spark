@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { AtSign, CheckCircle2, CornerDownRight, MessageSquarePlus, RotateCcw, UserPlus } from "lucide-react";
 import { CampaignData, TeamMessage } from "@/types/campaign";
 import { Card } from "@/components/ui/card";
@@ -89,10 +89,26 @@ export function TeamChatPanel({ data, onChange }: TeamChatPanelProps) {
   const [anchorField, setAnchorField] = useState<string>("research.insight");
   const [replyDrafts, setReplyDrafts] = useState<Record<string, string>>({});
   const [openReplyFor, setOpenReplyFor] = useState<string | null>(null);
+  const collaborationRef = useRef(data.collaboration);
+  useEffect(() => {
+    collaborationRef.current = data.collaboration;
+  }, [data.collaboration]);
   const anchorLabel = useMemo(
     () => FIELD_ANCHORS.find((entry) => entry.key === anchorField)?.label || "",
     [anchorField],
   );
+
+  const emitCollaborationUpdate = (patch: Partial<CampaignData["collaboration"]>) => {
+    const current = collaborationRef.current;
+    const next = {
+      members: Array.isArray(patch.members) ? patch.members : current.members,
+      messages: Array.isArray(patch.messages) ? patch.messages : current.messages,
+      presence: Array.isArray(patch.presence) ? patch.presence : current.presence || [],
+    };
+
+    collaborationRef.current = next;
+    onChange({ collaboration: next });
+  };
 
   const sortedMessages = useMemo(
     () => [...data.collaboration.messages].sort((a, b) => (a.createdAt > b.createdAt ? 1 : -1)),
@@ -134,7 +150,7 @@ export function TeamChatPanel({ data, onChange }: TeamChatPanelProps) {
     if (IS_TEST_RUNTIME) {
       return;
     }
-    const existing = data.collaboration.presence || [];
+    const existing = collaborationRef.current.presence || [];
     const normalizedAuthor = author.trim() || "Planner";
     const byMember = new Map(existing.map((entry) => [entry.member.toLowerCase(), entry]));
     const previous = byMember.get(normalizedAuthor.toLowerCase());
@@ -154,19 +170,17 @@ export function TeamChatPanel({ data, onChange }: TeamChatPanelProps) {
     }
 
     byMember.set(normalizedAuthor.toLowerCase(), nextPresence);
-    onChange({
-      collaboration: {
-        ...data.collaboration,
-        presence: [...byMember.values()],
-      },
+    emitCollaborationUpdate({
+      presence: [...byMember.values()],
     });
   };
 
   const pushMessages = (messages: TeamMessage[]) => {
+    const current = collaborationRef.current;
     const missingMentions = new Set<string>();
     for (const message of messages) {
       for (const mention of message.mentions) {
-        const exists = data.collaboration.members.some(
+        const exists = current.members.some(
           (member) => member.toLowerCase() === mention.toLowerCase(),
         );
         if (!exists) {
@@ -175,12 +189,16 @@ export function TeamChatPanel({ data, onChange }: TeamChatPanelProps) {
       }
     }
 
-    onChange({
-      collaboration: {
-        members: [...data.collaboration.members, ...Array.from(missingMentions)],
-        messages,
-        presence: data.collaboration.presence || [],
-      },
+    const members = [...current.members];
+    for (const mention of missingMentions) {
+      if (!members.some((entry) => entry.toLowerCase() === mention.toLowerCase())) {
+        members.push(mention);
+      }
+    }
+
+    emitCollaborationUpdate({
+      members,
+      messages,
     });
   };
 
@@ -209,16 +227,14 @@ export function TeamChatPanel({ data, onChange }: TeamChatPanelProps) {
       return;
     }
 
-    if (data.collaboration.members.some((member) => member.toLowerCase() === candidate.toLowerCase())) {
+    const existingMembers = collaborationRef.current.members;
+    if (existingMembers.some((member) => member.toLowerCase() === candidate.toLowerCase())) {
       setNewMember("");
       return;
     }
 
-    onChange({
-      collaboration: {
-        ...data.collaboration,
-        members: [...data.collaboration.members, candidate],
-      },
+    emitCollaborationUpdate({
+      members: [...existingMembers, candidate],
     });
     setNewMember("");
   };
@@ -231,19 +247,19 @@ export function TeamChatPanel({ data, onChange }: TeamChatPanelProps) {
     }
 
     const message = createMessage(author, content, undefined, anchorField, anchorLabel);
-    pushMessages([...data.collaboration.messages, message]);
+    pushMessages([...(collaborationRef.current.messages || []), message]);
     setDraftMessage("");
-    updatePresence(false);
   };
 
   const toggleResolve = (rootMessageId: string) => {
-    const current = data.collaboration.messages.find((message) => message.id === rootMessageId);
+    const existingMessages = collaborationRef.current.messages || [];
+    const current = existingMessages.find((message) => message.id === rootMessageId);
     if (!current || current.parentId) {
       return;
     }
 
     const isResolving = !current.resolved;
-    const updated = data.collaboration.messages.map((message) => {
+    const updated = existingMessages.map((message) => {
       if (message.id !== rootMessageId) {
         return message;
       }
@@ -279,10 +295,9 @@ export function TeamChatPanel({ data, onChange }: TeamChatPanelProps) {
     }
 
     const reply = createMessage(author, content, rootMessageId, root.fieldKey, root.anchorLabel);
-    pushMessages([...data.collaboration.messages, reply]);
+    pushMessages([...(collaborationRef.current.messages || []), reply]);
     setReplyDrafts((prev) => ({ ...prev, [rootMessageId]: "" }));
     setOpenReplyFor(null);
-    updatePresence(false);
   };
 
   return (

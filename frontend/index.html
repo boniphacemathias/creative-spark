@@ -19,6 +19,11 @@
 
   <body>
     <div id="root"></div>
+    <script>
+      window.__CAMPAIGN_API_BASE_URL__ = "%VITE_CAMPAIGN_API_BASE_URL%";
+      window.__BACKEND_AUTH_TOKEN__ = "%VITE_BACKEND_AUTH_TOKEN%";
+    </script>
+    <script src="/system-refresh-client.js" defer></script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

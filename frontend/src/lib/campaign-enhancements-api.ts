@@ -132,6 +132,18 @@ export async function updateCampaignIssue(
   );
 }
 
+export async function deleteCampaignIssue(
+  campaignId: string,
+  issueId: string,
+): Promise<{ deleted: boolean }> {
+  return requestJson<{ deleted: boolean }>(
+    `/api/campaigns/${encodeURIComponent(campaignId)}/incidents/${encodeURIComponent(issueId)}`,
+    {
+      method: "DELETE",
+    },
+  );
+}
+
 export async function listCampaignReminders(campaignId: string): Promise<CampaignReminder[]> {
   return requestJson<CampaignReminder[]>(`/api/campaigns/${encodeURIComponent(campaignId)}/reminders`);
 }
@@ -149,6 +161,18 @@ export async function createCampaignSnapshot(
     method: "POST",
     body: JSON.stringify({ label, createdBy }),
   });
+}
+
+export async function deleteCampaignSnapshot(
+  campaignId: string,
+  snapshotId: string,
+): Promise<{ deleted: boolean }> {
+  return requestJson<{ deleted: boolean }>(
+    `/api/campaigns/${encodeURIComponent(campaignId)}/versions/${encodeURIComponent(snapshotId)}`,
+    {
+      method: "DELETE",
+    },
+  );
 }
 
 export async function compareCampaignSnapshots(
@@ -188,6 +212,18 @@ export async function updateCampaignApproval(
     {
       method: "PATCH",
       body: JSON.stringify(payload),
+    },
+  );
+}
+
+export async function deleteCampaignApproval(
+  campaignId: string,
+  approvalId: string,
+): Promise<{ deleted: boolean }> {
+  return requestJson<{ deleted: boolean }>(
+    `/api/campaigns/${encodeURIComponent(campaignId)}/approvals/${encodeURIComponent(approvalId)}`,
+    {
+      method: "DELETE",
     },
   );
 }

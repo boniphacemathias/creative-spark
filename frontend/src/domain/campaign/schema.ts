@@ -1,5 +1,16 @@
 import { z } from "zod";
-import { CampaignData, DEFAULT_CREATIVE_BRIEF, DEFAULT_QA_CHECKLIST, DRIVER_MOTIVES } from "@/types/campaign";
+import {
+  CampaignData,
+  CampaignCrmLifecycle,
+  CampaignDigitalOps,
+  CampaignExperimentLab,
+  CampaignGovernancePolicy,
+  CampaignTemplateSystem,
+  CrmLifecycleSegment,
+  DEFAULT_CREATIVE_BRIEF,
+  DEFAULT_QA_CHECKLIST,
+  DRIVER_MOTIVES,
+} from "@/types/campaign";
 import { CampaignError } from "@/domain/campaign/errors";
 
 export interface CampaignRecord {
@@ -221,7 +232,7 @@ const issueSchema = z.object({
 
 const reminderSchema = z.object({
   id: z.string().trim().min(1),
-  type: z.enum(["inactive_concept", "unresolved_mention", "approval_pending", "overdue_issue"]),
+  type: z.enum(["inactive_concept", "unresolved_mention", "approval_pending", "overdue_issue", "segment_due_action"]),
   severity: z.enum(["info", "warning", "critical"]).default("info"),
   message: z.string().trim().min(1),
   createdAt: z.string().datetime(),
@@ -238,6 +249,98 @@ const portfolioSchema = z.object({
     culturalFit: z.number().min(0).max(1).default(0.15),
     risk: z.number().min(0).max(1).default(0.1),
   }),
+});
+
+const templateSystemSchema = z.object({
+  selectedTemplateId: z.string().trim().default("template-awareness"),
+  availableTemplates: z.array(
+    z.object({
+      id: z.string().trim().min(1),
+      name: z.string().trim().min(1),
+      industry: z.string().trim().default(""),
+      objectiveType: z.string().trim().default(""),
+      defaultSections: z.array(z.string().trim().min(1)).default([]),
+      localizationHints: z.array(z.string().trim().min(1)).default([]),
+    }),
+  ).default([]),
+  localization: z.object({
+    language: z.string().trim().default("English"),
+    tone: z.string().trim().default("Human-centered"),
+    culturalMustInclude: z.array(z.string().trim().min(1)).default([]),
+    culturalMustAvoid: z.array(z.string().trim().min(1)).default([]),
+  }),
+});
+
+const digitalOpsSchema = z.object({
+  attributionModel: z.enum(["last_touch", "first_touch", "weighted_multi_touch", "media_mix"]).default("weighted_multi_touch"),
+  channelSlaHours: z.array(
+    z.object({
+      channel: z.string().trim().min(1),
+      firstResponseHours: z.number().min(1).max(720).default(1),
+      followUpHours: z.number().min(1).max(720).default(24),
+    }),
+  ).default([]),
+  channelMetrics: z.array(
+    z.object({
+      id: z.string().trim().min(1),
+      channel: z.string().trim().default(""),
+      metric: z.string().trim().default(""),
+      value: z.string().trim().default(""),
+      period: z.string().trim().default(""),
+    }),
+  ).default([]),
+});
+
+const crmLifecycleSchema = z.object({
+  memberRetentionTarget: z.number().min(0).max(1).default(0.6),
+  segments: z.array(
+    z.object({
+      id: z.string().trim().min(1),
+      name: z.string().trim().min(1),
+      lifecycleStage: z.enum(["acquire", "onboard", "retain", "reactivate"]).default("acquire"),
+      size: z.number().int().min(0).default(0),
+      priority: z.enum(["high", "medium", "low"]).default("medium"),
+      nextAction: z.string().trim().default(""),
+      dueAt: z.string().datetime(),
+      owner: z.string().trim().default(""),
+    }),
+  ).default([]),
+  automationRules: z.array(
+    z.object({
+      id: z.string().trim().min(1),
+      trigger: z.string().trim().min(1),
+      action: z.string().trim().min(1),
+      slaHours: z.number().int().min(1).max(720).default(24),
+      active: z.boolean().default(true),
+    }),
+  ).default([]),
+});
+
+const experimentLabSchema = z.object({
+  experiments: z.array(
+    z.object({
+      id: z.string().trim().min(1),
+      name: z.string().trim().min(1),
+      hypothesis: z.string().trim().default(""),
+      metric: z.string().trim().default(""),
+      baseline: z.number().default(0),
+      target: z.number().default(0),
+      status: z.enum(["planned", "running", "completed", "stopped"]).default("planned"),
+      winnerConceptId: z.string().trim().optional(),
+      startDate: z.string().datetime(),
+      endDate: z.string().datetime().optional(),
+    }),
+  ).default([]),
+  promoteWinnerConceptId: z.string().trim().default(""),
+});
+
+const governancePolicySchema = z.object({
+  requiredApprovalRoles: z.array(
+    z.enum(["strategy_lead", "creative_lead", "client_partner", "compliance"]),
+  ).default(["strategy_lead", "creative_lead", "client_partner"]),
+  minApprovedCount: z.number().int().min(0).max(10).default(2),
+  requirePreflightPassForReady: z.boolean().default(true),
+  requireNoCriticalIncidentsForReady: z.boolean().default(true),
 });
 
 const snapshotSchema = z.object({
@@ -276,6 +379,108 @@ function createDefaultCreativeBrief() {
   };
 }
 
+function createDefaultTemplateSystem(): CampaignTemplateSystem {
+  return {
+    selectedTemplateId: "template-awareness",
+    availableTemplates: [
+      {
+        id: "template-awareness",
+        name: "Awareness Launch",
+        industry: "Brand",
+        objectiveType: "awareness",
+        defaultSections: ["research", "communication_brief", "creative_brief", "concept_board"],
+        localizationHints: ["language", "symbols", "social_norms"],
+      },
+      {
+        id: "template-conversion",
+        name: "Behavior Conversion",
+        industry: "Behavior Change",
+        objectiveType: "conversion",
+        defaultSections: ["research", "ideation", "concept_development", "prototype"],
+        localizationHints: ["barriers", "motivators", "trusted_voices"],
+      },
+    ],
+    localization: {
+      language: "English",
+      tone: "Human-centered",
+      culturalMustInclude: [],
+      culturalMustAvoid: [],
+    },
+  };
+}
+
+function createDefaultDigitalOps(): CampaignDigitalOps {
+  return {
+    attributionModel: "weighted_multi_touch",
+    channelSlaHours: [
+      { channel: "WhatsApp", firstResponseHours: 1, followUpHours: 24 },
+      { channel: "Email", firstResponseHours: 6, followUpHours: 48 },
+      { channel: "Social", firstResponseHours: 4, followUpHours: 24 },
+    ],
+    channelMetrics: [],
+  };
+}
+
+function createDefaultCrmLifecycle(): CampaignCrmLifecycle {
+  return {
+    memberRetentionTarget: 0.6,
+    segments: [
+      {
+        id: "crm-new",
+        name: "New Prospects",
+        lifecycleStage: "acquire",
+        size: 0,
+        priority: "high",
+        nextAction: "Run onboarding sequence",
+        dueAt: new Date().toISOString(),
+        owner: "Growth Lead",
+      },
+      {
+        id: "crm-active",
+        name: "Active Customers",
+        lifecycleStage: "retain",
+        size: 0,
+        priority: "medium",
+        nextAction: "Promote repeat behavior offer",
+        dueAt: new Date().toISOString(),
+        owner: "CRM Manager",
+      },
+    ],
+    automationRules: [
+      {
+        id: "rule-inactive-72h",
+        trigger: "no_activity_72h",
+        action: "send_reengagement_nudge",
+        slaHours: 24,
+        active: true,
+      },
+      {
+        id: "rule-unresolved-24h",
+        trigger: "unresolved_comment_24h",
+        action: "notify_owner",
+        slaHours: 12,
+        active: true,
+      },
+    ],
+  };
+}
+
+function createDefaultExperimentLab(): CampaignExperimentLab {
+  return {
+    experiments: [],
+    promoteWinnerConceptId: "",
+  };
+}
+
+function createDefaultGovernancePolicy(): CampaignGovernancePolicy {
+  return {
+    requiredApprovalRoles: ["strategy_lead", "creative_lead", "client_partner"] as const,
+    minApprovedCount: 2,
+    requirePreflightPassForReady: true,
+    requireNoCriticalIncidentsForReady: true,
+  };
+}
+
 export const campaignDataSchema = z.object({
   campaign: campaignSchema,
   audiences: z.array(audienceSchema).default([]),
@@ -305,6 +510,11 @@ export const campaignDataSchema = z.object({
   issues: z.array(issueSchema).default([]),
   reminders: z.array(reminderSchema).default([]),
   portfolio: portfolioSchema.optional(),
+  templateSystem: templateSystemSchema.optional(),
+  digitalOps: digitalOpsSchema.optional(),
+  crmLifecycle: crmLifecycleSchema.optional(),
+  experimentLab: experimentLabSchema.optional(),
+  governancePolicy: governancePolicySchema.optional(),
   snapshots: z.array(snapshotSchema).default([]),
   approvals: z.array(approvalSchema).default([]),
   auditTrail: z.array(auditEventSchema).default([]),
@@ -441,6 +651,154 @@ function normalizeCampaignData(data: CampaignData): CampaignData {
       risk: 0.1,
     },
   };
+  const defaultTemplateSystem = createDefaultTemplateSystem();
+  const templateSystem = data.templateSystem || defaultTemplateSystem;
+  const availableTemplates = uniqueBy(
+    (templateSystem.availableTemplates || []).map((entry) => ({
+      ...entry,
+      defaultSections: uniqueBy(
+        (entry.defaultSections || []).map((value) => value.trim()).filter(Boolean),
+        (value) => value,
+      ),
+      localizationHints: uniqueBy(
+        (entry.localizationHints || []).map((value) => value.trim()).filter(Boolean),
+        (value) => value,
+      ),
+    })),
+    (entry) => entry.id,
+  );
+  const fallbackTemplateId = availableTemplates[0]?.id || defaultTemplateSystem.selectedTemplateId;
+  const selectedTemplateId =
+    availableTemplates.some((entry) => entry.id === templateSystem.selectedTemplateId)
+      ? templateSystem.selectedTemplateId
+      : fallbackTemplateId;
+  const templateLocalization = {
+    ...defaultTemplateSystem.localization,
+    ...(templateSystem.localization || {}),
+    culturalMustInclude: uniqueBy(
+      (templateSystem.localization?.culturalMustInclude || [])
+        .map((entry) => entry.trim())
+        .filter(Boolean),
+      (entry) => entry.toLowerCase(),
+    ),
+    culturalMustAvoid: uniqueBy(
+      (templateSystem.localization?.culturalMustAvoid || [])
+        .map((entry) => entry.trim())
+        .filter(Boolean),
+      (entry) => entry.toLowerCase(),
+    ),
+  };
+
+  const defaultDigitalOps = createDefaultDigitalOps();
+  const digitalOps = data.digitalOps || defaultDigitalOps;
+  const attributionModel: CampaignDigitalOps["attributionModel"] = (
+    digitalOps.attributionModel === "last_touch" ||
+    digitalOps.attributionModel === "first_touch" ||
+    digitalOps.attributionModel === "weighted_multi_touch" ||
+    digitalOps.attributionModel === "media_mix"
+  )
+    ? digitalOps.attributionModel
+    : "weighted_multi_touch";
+  const channelSlaHours = uniqueBy(
+    (digitalOps.channelSlaHours || []).map((entry) => ({
+      channel: entry.channel?.trim() || "Channel",
+      firstResponseHours: Number.isFinite(Number(entry.firstResponseHours))
+        ? Math.max(1, Math.min(720, Math.round(Number(entry.firstResponseHours))))
+        : 1,
+      followUpHours: Number.isFinite(Number(entry.followUpHours))
+        ? Math.max(1, Math.min(720, Math.round(Number(entry.followUpHours))))
+        : 24,
+    })),
+    (entry) => entry.channel.toLowerCase(),
+  );
+  const channelMetrics = uniqueBy(
+    (digitalOps.channelMetrics || []).map((entry, index) => ({
+      id: entry.id || `metric-${index + 1}`,
+      channel: entry.channel || "",
+      metric: entry.metric || "",
+      value: entry.value || "",
+      period: entry.period || "",
+    })),
+    (entry) => entry.id,
+  );
+
+  const defaultCrmLifecycle = createDefaultCrmLifecycle();
+  const crmLifecycle = data.crmLifecycle || defaultCrmLifecycle;
+  const crmSegments = uniqueBy(
+    (crmLifecycle.segments || []).map((entry, index) => {
+      const lifecycleStage: CrmLifecycleSegment["lifecycleStage"] = (
+        entry.lifecycleStage === "acquire" ||
+        entry.lifecycleStage === "onboard" ||
+        entry.lifecycleStage === "retain" ||
+        entry.lifecycleStage === "reactivate"
+      )
+        ? entry.lifecycleStage
+        : "acquire";
+      const priority: CrmLifecycleSegment["priority"] = (
+        entry.priority === "high" || entry.priority === "medium" || entry.priority === "low"
+      )
+        ? entry.priority
+        : "medium";
+      const segment: CrmLifecycleSegment = {
+        id: entry.id || `crm-segment-${index + 1}`,
+        name: entry.name || `Segment ${index + 1}`,
+        lifecycleStage,
+        size: Number.isFinite(Number(entry.size)) ? Math.max(0, Math.round(Number(entry.size))) : 0,
+        priority,
+        nextAction: entry.nextAction || "",
+        dueAt: entry.dueAt || new Date().toISOString(),
+        owner: entry.owner || "",
+      };
+      return segment;
+    }),
+    (entry) => entry.id,
+  );
+  const crmAutomationRules = uniqueBy(
+    (crmLifecycle.automationRules || []).map((entry, index) => ({
+      id: entry.id || `crm-rule-${index + 1}`,
+      trigger: entry.trigger || "",
+      action: entry.action || "",
+      slaHours: Number.isFinite(Number(entry.slaHours))
+        ? Math.max(1, Math.min(720, Math.round(Number(entry.slaHours))))
+        : 24,
+      active: entry.active !== false,
+    })),
+    (entry) => entry.id,
+  );
+  const memberRetentionTarget = Number.isFinite(Number(crmLifecycle.memberRetentionTarget))
+    ? Math.max(0, Math.min(1, Number(crmLifecycle.memberRetentionTarget)))
+    : defaultCrmLifecycle.memberRetentionTarget;
+
+  const defaultExperimentLab = createDefaultExperimentLab();
+  const experimentLab = data.experimentLab || defaultExperimentLab;
+  const experiments = uniqueBy(
+    (experimentLab.experiments || []).map((entry, index) => ({
+      id: entry.id || `exp-${index + 1}`,
+      name: entry.name || `Experiment ${index + 1}`,
+      hypothesis: entry.hypothesis || "",
+      metric: entry.metric || "",
+      baseline: Number.isFinite(Number(entry.baseline)) ? Number(entry.baseline) : 0,
+      target: Number.isFinite(Number(entry.target)) ? Number(entry.target) : 0,
+      status: entry.status || "planned",
+      winnerConceptId: entry.winnerConceptId || undefined,
+      startDate: entry.startDate || new Date().toISOString(),
+      endDate: entry.endDate || undefined,
+    })),
+    (entry) => entry.id,
+  );
+  const promoteWinnerConceptId = experimentLab.promoteWinnerConceptId || "";
+
+  const defaultGovernancePolicy = createDefaultGovernancePolicy();
+  const governancePolicy = data.governancePolicy || defaultGovernancePolicy;
+  const requiredApprovalRoles = uniqueBy(
+    (governancePolicy.requiredApprovalRoles || []).filter((role) =>
+      role === "strategy_lead" || role === "creative_lead" || role === "client_partner" || role === "compliance",
+    ),
+    (role) => role,
+  );
+  const minApprovedCount = Number.isFinite(Number(governancePolicy.minApprovedCount))
+    ? Math.max(0, Math.min(10, Math.round(Number(governancePolicy.minApprovedCount))))
+    : defaultGovernancePolicy.minApprovedCount;
 
   return {
     ...data,
@@ -474,6 +832,33 @@ function normalizeCampaignData(data: CampaignData): CampaignData {
     issues,
     reminders,
     portfolio,
+    templateSystem: {
+      selectedTemplateId,
+      availableTemplates: availableTemplates.length > 0 ? availableTemplates : defaultTemplateSystem.availableTemplates,
+      localization: templateLocalization,
+    },
+    digitalOps: {
+      attributionModel,
+      channelSlaHours: channelSlaHours.length > 0 ? channelSlaHours : defaultDigitalOps.channelSlaHours,
+      channelMetrics,
+    },
+    crmLifecycle: {
+      memberRetentionTarget,
+      segments: crmSegments.length > 0 ? crmSegments : defaultCrmLifecycle.segments,
+      automationRules: crmAutomationRules.length > 0 ? crmAutomationRules : defaultCrmLifecycle.automationRules,
+    },
+    experimentLab: {
+      experiments,
+      promoteWinnerConceptId,
+    },
+    governancePolicy: {
+      requiredApprovalRoles: requiredApprovalRoles.length > 0
+        ? requiredApprovalRoles
+        : [...defaultGovernancePolicy.requiredApprovalRoles],
+      minApprovedCount,
+      requirePreflightPassForReady: governancePolicy.requirePreflightPassForReady !== false,
+      requireNoCriticalIncidentsForReady: governancePolicy.requireNoCriticalIncidentsForReady !== false,
+    },
     snapshots,
     approvals,
     auditTrail,

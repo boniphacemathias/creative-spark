@@ -45,6 +45,34 @@ function mergeTeamMessages(localMessages: TeamMessage[], remoteMessages: TeamMes
   return [...byId.values()].sort((a, b) => (a.createdAt > b.createdAt ? 1 : -1));
 }
 
+function mergeCollaborationPresence(
+  localPresence: CampaignData["collaboration"]["presence"],
+  remotePresence: CampaignData["collaboration"]["presence"],
+) {
+  const byMember = new Map<string, CampaignData["collaboration"]["presence"][number]>();
+  for (const entry of [...(localPresence || []), ...(remotePresence || [])]) {
+    if (!entry || typeof entry !== "object") {
+      continue;
+    }
+    const member = String(entry.member || "").trim();
+    if (!member) {
+      continue;
+    }
+    const key = member.toLowerCase();
+    const existing = byMember.get(key);
+    if (!existing) {
+      byMember.set(key, entry);
+      continue;
+    }
+    const existingSeenAt = Date.parse(existing.lastSeenAt);
+    const nextSeenAt = Date.parse(entry.lastSeenAt);
+    if (!Number.isFinite(existingSeenAt) || nextSeenAt >= existingSeenAt) {
+      byMember.set(key, entry);
+    }
+  }
+  return [...byMember.values()];
+}
+
 function mergeCollaborationState(local: CampaignData["collaboration"], remote: CampaignData["collaboration"]) {
   const members: string[] = [];
   for (const name of [...local.members, ...remote.members]) {
@@ -55,6 +83,7 @@ function mergeCollaborationState(local: CampaignData["collaboration"], remote: C
   return {
     members,
     messages: mergeTeamMessages(local.messages, remote.messages),
+    presence: mergeCollaborationPresence(local.presence || [], remote.presence || []),
   };
 }
 
@@ -89,7 +118,30 @@ export default function CampaignWizard() {
     if (partial.collaboration) {
       prioritizeFastSaveRef.current = true;
     }
-    setData((prev) => (prev ? { ...prev, ...partial } : prev));
+    setData((prev) => {
+      if (!prev) {
+        return prev;
+      }
+      if (!partial.collaboration) {
+        return { ...prev, ...partial };
+      }
+
+      return {
+        ...prev,
+        ...partial,
+        collaboration: {
+          members: Array.isArray(partial.collaboration.members)
+            ? partial.collaboration.members
+            : prev.collaboration.members,
+          messages: Array.isArray(partial.collaboration.messages)
+            ? partial.collaboration.messages
+            : prev.collaboration.messages,
+          presence: Array.isArray(partial.collaboration.presence)
+            ? partial.collaboration.presence
+            : prev.collaboration.presence,
+        },
+      };
+    });
   };
 
   const syncCampaignFromServer = useCallback(async (force = false) => {
