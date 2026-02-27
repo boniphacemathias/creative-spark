@@ -10,7 +10,7 @@ import { GlobalErrorToaster } from "./components/GlobalErrorToaster";
 import { ProtectedRoute } from "./components/ProtectedRoute";
 import Index from "./pages/Index";
 import CampaignWizard from "./pages/CampaignWizard";
-import Settings from "./pages/Settings";
+import AdminDashboard from "./pages/AdminDashboard";
 import AIDrive from "./pages/AIDrive";
 import Diagnostics from "./pages/Diagnostics";
 import ActivityCenter from "./pages/ActivityCenter";
@@ -72,10 +72,18 @@ const App = () => (
                   }
                 />
                 <Route
+                  path="/admin"
+                  element={
+                    <ProtectedRoute allowedRoles={["admin"]}>
+                      <AdminDashboard />
+                    </ProtectedRoute>
+                  }
+                />
+                <Route
                   path="/settings"
                   element={
                     <ProtectedRoute allowedRoles={["admin"]}>
-                      <Settings />
+                      <AdminDashboard />
                     </ProtectedRoute>
                   }
                 />

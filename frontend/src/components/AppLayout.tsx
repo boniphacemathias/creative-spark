@@ -28,6 +28,7 @@ import { recordCampaignVisit } from "@/lib/recent-campaigns";
 import { KeyboardShortcutsDialog } from "@/components/KeyboardShortcutsDialog";
 import { useWorkspaceNotifications } from "@/hooks/use-workspace-notifications";
 import { ThemeToggle } from "@/components/ThemeToggle";
+import useTranslation from "@/hooks/useTranslation";
 
 function formatRelativeTime(value: string) {
   const timestamp = new Date(value);
@@ -46,6 +47,7 @@ function formatRelativeTime(value: string) {
 
 export function AppLayout() {
   const location = useLocation();
+  const { language, setLanguage, t } = useTranslation();
   const { workspaceId, activeWorkspace } = useAppWorkspace();
   const [campaigns, setCampaigns] = useState<CampaignData[]>([]);
   const activityItems = useActivityFeed(10, workspaceId);
@@ -80,8 +82,8 @@ export function AppLayout() {
     if (location.pathname === "/diagnostics") {
       return [{ label: "Diagnostics", href: "/diagnostics" }];
     }
-    if (location.pathname === "/settings") {
-      return [{ label: "Settings", href: "/settings" }];
+    if (location.pathname === "/admin" || location.pathname === "/settings") {
+      return [{ label: "Admin", href: "/admin" }];
     }
     return [{ label: "Workspace", href: location.pathname }];
   }, [activeCampaign?.campaign.name, location.pathname]);
@@ -142,6 +144,18 @@ export function AppLayout() {
               </span>
             </div>
             <div className="flex items-center gap-2">
+              <label className="hidden lg:flex items-center gap-2 text-xs text-muted-foreground" htmlFor="app-language">
+                {t("language")}
+                <select
+                  id="app-language"
+                  className="h-8 rounded-md border border-input bg-background px-2 text-xs text-foreground"
+                  value={language}
+                  onChange={(event) => setLanguage(event.target.value)}
+                >
+                  <option value="en">{t("english")}</option>
+                  <option value="sw">{t("kiswahili")}</option>
+                </select>
+              </label>
               <AppCommandPalette campaigns={campaigns} />
               <KeyboardShortcutsDialog />
               <ThemeToggle />

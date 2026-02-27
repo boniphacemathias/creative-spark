@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
-import { Megaphone, Sparkles, Settings, FolderKanban, Plus, Activity, Bell, TowerControl } from "lucide-react";
+import { Megaphone, Sparkles, ShieldCheck, FolderKanban, Plus, Activity, Bell, TowerControl } from "lucide-react";
 import { NavLink } from "@/components/NavLink";
 import {
   Sidebar,
@@ -29,7 +29,7 @@ const navItems = [
   { title: "Control Tower", url: "/control-tower", icon: TowerControl, allowedRoles: ["admin", "operator", "viewer"] as AppRole[] },
   { title: "Activity", url: "/activity", icon: Bell, allowedRoles: ["admin", "operator", "viewer"] as AppRole[] },
   { title: "Diagnostics", url: "/diagnostics", icon: Activity, allowedRoles: ["admin", "operator"] as AppRole[] },
-  { title: "Settings", url: "/settings", icon: Settings, allowedRoles: ["admin"] as AppRole[] },
+  { title: "Admin", url: "/admin", icon: ShieldCheck, allowedRoles: ["admin"] as AppRole[] },
 ];
 
 export function AppSidebar() {

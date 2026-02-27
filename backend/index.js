@@ -4866,6 +4866,54 @@ async function listDriveFiles(campaignId = null, workspaceId = DEFAULT_WORKSPACE
   );
 }
 
+function sanitizeDownloadFilename(value, fallback = "download.bin") {
+  const normalized = normalizeName(value) || fallback;
+  const sanitized = normalized
+    .replace(/[\r\n"]/g, "")
+    .replace(/[\\/]/g, "-")
+    .replace(/[^A-Za-z0-9._ -]/g, "_")
+    .trim();
+  if (!sanitized) {
+    return fallback;
+  }
+  return sanitized.slice(0, 160);
+}
+
+async function getDriveFileDownload(
+  id,
+  campaignId = null,
+  workspaceId = DEFAULT_WORKSPACE_ID,
+) {
+  const scopeCampaignId = normalizeDriveCampaignId(campaignId);
+  const store = normalizeDriveStore(await readDriveStore(workspaceId));
+  const file = store.files.find((entry) => entry.id === id && entry.campaignId === scopeCampaignId);
+  if (!file) {
+    return null;
+  }
+
+  const contentBase64 =
+    typeof file.contentBase64 === "string" && file.contentBase64.trim()
+      ? file.contentBase64.trim()
+      : "";
+  const binaryBuffer = decodeBase64Buffer(contentBase64);
+  if (binaryBuffer) {
+    return {
+      file,
+      buffer: binaryBuffer,
+      mimeType: String(file.mimeType || "application/octet-stream"),
+      filename: sanitizeDownloadFilename(file.name, `drive-file-${id}`),
+    };
+  }
+
+  const extractedText = String(file.extractedText || "");
+  return {
+    file,
+    buffer: Buffer.from(extractedText, "utf8"),
+    mimeType: "text/plain; charset=utf-8",
+    filename: sanitizeDownloadFilename(file.name, `drive-file-${id}.txt`),
+  };
+}
+
 function createEmptyChatStore() {
   return {
     version: 1,
@@ -7273,6 +7321,32 @@ function sendJson(req, res, status, payload) {
   logRequestComplete(req, status);
 }
 
+function sendBinary(req, res, status, content, options = {}) {
+  const origin = getRequestOrigin(req);
+  const requestId = getRequestId(req);
+  const headers = {
+    "Content-Type": options.contentType || "application/octet-stream",
+    "Content-Length": String(content?.length || 0),
+    "Cache-Control": "no-store",
+    "Access-Control-Allow-Methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
+    "Access-Control-Allow-Headers": buildCorsAllowHeaders(req),
+    "Access-Control-Expose-Headers": "X-Request-Id,Content-Disposition,Content-Type,Content-Length",
+    Vary: "Origin",
+    "X-Request-Id": requestId,
+  };
+
+  const filename = sanitizeDownloadFilename(options.filename || "", "download.bin");
+  headers["Content-Disposition"] = `attachment; filename="${filename}"`;
+
+  if (origin && isOriginAllowed(origin)) {
+    headers["Access-Control-Allow-Origin"] = origin;
+  }
+
+  res.writeHead(status, headers);
+  res.end(content);
+  logRequestComplete(req, status);
+}
+
 async function readRequestJson(req) {
   const chunks = [];
   for await (const chunk of req) {
@@ -7381,6 +7455,24 @@ const server = createServer(async (req, res) => {
       const workspaceId = getRequestWorkspaceId(req);
       const campaignId = parseNullableFolderId(url.searchParams.get("campaignId"));
       sendJson(req, res, 200, await listDriveFiles(campaignId, workspaceId));
+      return;
+    }
+
+    const driveDownloadMatch = pathname.match(/^\/api\/drive\/files\/([^/]+)\/download$/);
+    if (driveDownloadMatch && req.method === "GET") {
+      const workspaceId = getRequestWorkspaceId(req);
+      const id = decodeURIComponent(driveDownloadMatch[1]);
+      const campaignId = parseNullableFolderId(url.searchParams.get("campaignId"));
+      const result = await getDriveFileDownload(id, campaignId, workspaceId);
+      if (!result) {
+        sendJson(req, res, 404, { error: "Drive file not found" });
+        return;
+      }
+
+      sendBinary(req, res, 200, result.buffer, {
+        contentType: result.mimeType,
+        filename: result.filename,
+      });
       return;
     }
 

@@ -1,5 +1,9 @@
 import { DriveEntry, DriveFile, DriveFolder } from "@/lib/drive-storage";
-import { appendRequestIdToErrorMessage, buildJsonHeaders } from "@/lib/api/request-tracing";
+import {
+  appendRequestIdToErrorMessage,
+  buildJsonHeaders,
+  createRequestId,
+} from "@/lib/api/request-tracing";
 import { getActiveWorkspaceId } from "@/lib/workspace";
 
 const API_BASE_URL =
@@ -7,6 +11,58 @@ const API_BASE_URL =
 const API_AUTH_TOKEN = (typeof import.meta.env.VITE_BACKEND_AUTH_TOKEN === "string"
   ? import.meta.env.VITE_BACKEND_AUTH_TOKEN.trim()
   : "");
+
+function buildAuthHeaders(): Record<string, string> {
+  if (!API_AUTH_TOKEN) {
+    return {};
+  }
+
+  return {
+    Authorization: `Bearer ${API_AUTH_TOKEN}`,
+    "X-API-Key": API_AUTH_TOKEN,
+  };
+}
+
+function buildDriveHeaders(initHeaders?: HeadersInit): Headers {
+  const headers = new Headers(initHeaders);
+  const authHeaders = buildAuthHeaders();
+  for (const [key, value] of Object.entries(authHeaders)) {
+    headers.set(key, value);
+  }
+  headers.set("X-Workspace-Id", getActiveWorkspaceId());
+  if (!headers.has("X-Request-Id")) {
+    headers.set("X-Request-Id", createRequestId("drive"));
+  }
+  return headers;
+}
+
+function readDownloadFilename(contentDisposition: string | null, fallback: string): string {
+  const value = String(contentDisposition || "");
+  if (!value) {
+    return fallback;
+  }
+
+  const encodedMatch = value.match(/filename\*=UTF-8''([^;]+)/i);
+  if (encodedMatch?.[1]) {
+    try {
+      return decodeURIComponent(encodedMatch[1]);
+    } catch {
+      return encodedMatch[1];
+    }
+  }
+
+  const quotedMatch = value.match(/filename="([^"]+)"/i);
+  if (quotedMatch?.[1]) {
+    return quotedMatch[1];
+  }
+
+  const plainMatch = value.match(/filename=([^;]+)/i);
+  if (plainMatch?.[1]) {
+    return plainMatch[1].trim();
+  }
+
+  return fallback;
+}
 
 function isTextLikeFile(file: File): boolean {
   const mimeType = (file.type || "").toLowerCase();
@@ -39,18 +95,10 @@ function arrayBufferToBase64(buffer: ArrayBuffer): string {
 }
 
 async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
-  const authHeaders =
-    API_AUTH_TOKEN
-      ? {
-          Authorization: `Bearer ${API_AUTH_TOKEN}`,
-          "X-API-Key": API_AUTH_TOKEN,
-        }
-      : {};
-
   const response = await fetch(`${API_BASE_URL}${path}`, {
     ...init,
     headers: buildJsonHeaders(init?.headers, {
-      ...authHeaders,
+      ...buildAuthHeaders(),
       "X-Workspace-Id": getActiveWorkspaceId(),
     }),
   });
@@ -110,6 +158,42 @@ export async function listDriveFiles(campaignId: string | null = null): Promise<
     params.set("campaignId", campaignId);
   }
   return requestJson<DriveFile[]>(`/api/drive/files?${params.toString()}`);
+}
+
+export interface DownloadDriveFilePayload {
+  blob: Blob;
+  fileName: string;
+  mimeType: string;
+}
+
+export async function downloadDriveFile(
+  id: string,
+  campaignId: string | null = null,
+): Promise<DownloadDriveFilePayload> {
+  const params = new URLSearchParams();
+  if (campaignId) {
+    params.set("campaignId", campaignId);
+  }
+  const query = params.toString();
+  const suffix = query ? `?${query}` : "";
+
+  const response = await fetch(`${API_BASE_URL}/api/drive/files/${encodeURIComponent(id)}/download${suffix}`, {
+    method: "GET",
+    headers: buildDriveHeaders(),
+  });
+
+  if (!response.ok) {
+    const payload = (await response.json().catch(() => ({}))) as { error?: string };
+    const message = payload.error || `Drive download failed: ${response.status}`;
+    throw new Error(appendRequestIdToErrorMessage(message, response));
+  }
+
+  const blob = await response.blob();
+  return {
+    blob,
+    fileName: readDownloadFilename(response.headers.get("content-disposition"), `drive-file-${id}`),
+    mimeType: response.headers.get("content-type") || blob.type || "application/octet-stream",
+  };
 }
 
 export async function createDriveFolder(

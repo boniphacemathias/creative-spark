@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { FilePlus2, FolderKanban, Megaphone, Settings, Activity, Bell, Star, TowerControl, ClipboardCheck, FileText } from "lucide-react";
+import { FilePlus2, FolderKanban, Megaphone, ShieldCheck, Activity, Bell, Star, TowerControl, ClipboardCheck, FileText } from "lucide-react";
 import {
   CommandDialog,
   CommandEmpty,
@@ -56,7 +56,7 @@ export function AppCommandPalette({ campaigns }: AppCommandPaletteProps) {
       items.push({ label: "Diagnostics", path: "/diagnostics", icon: Activity });
     }
     if (permissions.canAccessSettings) {
-      items.push({ label: "Settings", path: "/settings", icon: Settings });
+      items.push({ label: "Admin", path: "/admin", icon: ShieldCheck });
     }
     return items;
   }, [permissions.canAccessDiagnostics, permissions.canAccessSettings]);
